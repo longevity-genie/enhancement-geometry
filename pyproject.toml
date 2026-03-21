@@ -1,0 +1,18 @@
+[project]
+name = "compass-web"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "antonkulaga", email = "antonkulaga@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "compas>=2.15.1",
+    "jupyterlab>=4.5.6",
+    "pythreejs>=2.4.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11.0"]
+build-backend = "uv_build"
