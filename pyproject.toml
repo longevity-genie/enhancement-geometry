@@ -10,7 +10,10 @@ requires-python = ">=3.14"
 dependencies = [
     "compas>=2.15.1",
     "jupyterlab>=4.5.6",
+    "numpy>=2.4.3",
     "pythreejs>=2.4.2",
+    "pyvista>=0.47.1",
+    "scipy>=1.17.1",
 ]
 
 [build-system]
