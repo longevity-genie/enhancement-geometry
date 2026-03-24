@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import importlib.util
 import json
 from pathlib import Path
 
@@ -62,10 +63,45 @@ class SurfaceGenerationResult:
     generated_surface: pv.PolyData
     larger_surface: pv.PolyData
     smaller_surface: pv.PolyData
-    uniform_cap_surface: pv.PolyData
-    scaled_uniform_cap_surface: pv.PolyData
-    uniform_cap_edge_loft_surface: pv.PolyData
-    uniform_cap_closed_surface: pv.PolyData
+
+
+@dataclass(frozen=True)
+class MeshCleanupResult:
+    kept_meshes: tuple[pv.PolyData, ...]
+    kept_surface_meshes: tuple[pv.PolyData, ...]
+    kept_indices: tuple[int, ...]
+    removed_indices: tuple[int, ...]
+    naked_edge_meshes: tuple[pv.PolyData, ...]
+    naked_edge_loops_by_mesh: tuple[tuple[np.ndarray, ...], ...]
+
+
+@dataclass(frozen=True)
+class MeshPrintabilityReport:
+    point_count: int
+    face_count: int
+    connected_region_count: int
+    boundary_edge_count: int
+    boundary_loop_count: int
+    non_manifold_edge_count: int
+    is_closed: bool
+    is_printable: bool
+
+
+@dataclass(frozen=True)
+class MeshPreparationResult:
+    mesh: pv.PolyData
+    initial_report: MeshPrintabilityReport
+    final_report: MeshPrintabilityReport
+    repair_attempted: bool
+    repair_method: str | None
+
+
+@dataclass(frozen=True)
+class AnalysisOutputMeshes:
+    preview_meshes: tuple[pv.PolyData, ...]
+    output_meshes: tuple[pv.PolyData, ...]
+    output_modes: tuple[str, ...]
+    removed_by_retained_volume_indices: tuple[int, ...]
 
 
 def load_generation_config(path: str | Path) -> LoftedVoronoiConfig:
@@ -235,8 +271,785 @@ def build_polyline_mesh(polylines: list[np.ndarray]) -> pv.PolyData:
     return pv.PolyData(np.array(points, dtype=float), lines=np.array(lines, dtype=np.int64))
 
 
+def scale_points_in_xy(
+    points: np.ndarray,
+    center: np.ndarray,
+    scale_x: float,
+    scale_y: float,
+) -> np.ndarray:
+    scaled_points = np.asarray(points, dtype=float).copy()
+    scaled_points[:, 0] = center[0] + scale_x * (scaled_points[:, 0] - center[0])
+    scaled_points[:, 1] = center[1] + scale_y * (scaled_points[:, 1] - center[1])
+    return scaled_points
+
+
+def scale_polydata_in_xy(
+    mesh: pv.PolyData,
+    center: np.ndarray,
+    scale_x: float,
+    scale_y: float,
+) -> pv.PolyData:
+    if mesh.n_points == 0:
+        return pv.PolyData()
+    scaled = mesh.copy(deep=True)
+    scaled.points = scale_points_in_xy(
+        mesh.points,
+        center=center,
+        scale_x=scale_x,
+        scale_y=scale_y,
+    )
+    return scaled
+
+
+def count_connected_regions(mesh: pv.PolyData) -> int:
+    if mesh.n_cells == 0:
+        return 0
+    connected = mesh.connectivity()
+    region_ids = np.asarray(connected["RegionId"], dtype=int)
+    return int(np.unique(region_ids).size) if region_ids.size > 0 else 0
+
+
+def extract_surface_mesh(mesh: pv.PolyData) -> pv.PolyData:
+    if mesh.n_points == 0 or mesh.n_cells == 0:
+        return pv.PolyData()
+    return mesh.extract_surface(algorithm="dataset_surface").triangulate().clean()
+
+
+def unify_mesh_normals(mesh: pv.PolyData) -> pv.PolyData:
+    if mesh.n_points == 0 or mesh.n_cells == 0:
+        return pv.PolyData()
+    return mesh.compute_normals(
+        consistent_normals=True,
+        auto_orient_normals=True,
+        cell_normals=True,
+        point_normals=True,
+        flip_normals=False,
+    )
+
+
+def remove_closed_regions(mesh: pv.PolyData) -> pv.PolyData:
+    if mesh.n_points == 0 or mesh.n_cells == 0:
+        return pv.PolyData()
+
+    n_regions = count_connected_regions(mesh)
+    if n_regions <= 1:
+        boundary = mesh.extract_feature_edges(
+            boundary_edges=True,
+            feature_edges=False,
+            manifold_edges=False,
+            non_manifold_edges=False,
+        ).clean()
+        if boundary.n_cells > 0:
+            return mesh
+        return pv.PolyData()
+
+    connected = mesh.connectivity()
+    region_ids = np.asarray(connected["RegionId"], dtype=int)
+    keep_mask = np.zeros(connected.n_cells, dtype=bool)
+
+    for rid in range(n_regions):
+        region_cell_mask = region_ids == rid
+        region = connected.extract_cells(np.flatnonzero(region_cell_mask))
+        region_surf = extract_surface_mesh(region)
+        if region_surf.n_cells == 0:
+            continue
+        boundary = region_surf.extract_feature_edges(
+            boundary_edges=True,
+            feature_edges=False,
+            manifold_edges=False,
+            non_manifold_edges=False,
+        ).clean()
+        if boundary.n_cells > 0:
+            keep_mask[region_cell_mask] = True
+
+    if keep_mask.all():
+        return mesh
+
+    kept = connected.extract_cells(np.flatnonzero(keep_mask))
+    return kept.extract_surface().triangulate().clean() if kept.n_cells > 0 else pv.PolyData()
+
+
+def resolve_non_manifold_faces(surface: pv.PolyData) -> pv.PolyData:
+    if surface.n_points == 0 or surface.n_cells == 0:
+        return pv.PolyData()
+
+    surface = surface.triangulate().clean()
+    points = np.asarray(surface.points, dtype=float)
+    faces_raw = np.asarray(surface.faces, dtype=int)
+
+    face_verts: list[tuple[int, int, int]] = []
+    cursor = 0
+    while cursor < len(faces_raw):
+        n = int(faces_raw[cursor])
+        if n == 3:
+            face_verts.append((
+                int(faces_raw[cursor + 1]),
+                int(faces_raw[cursor + 2]),
+                int(faces_raw[cursor + 3]),
+            ))
+        cursor += n + 1
+
+    if not face_verts:
+        return surface
+
+    def _face_edges(fi: int) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+        a, b, c = face_verts[fi]
+        return (min(a, b), max(a, b)), (min(b, c), max(b, c)), (min(a, c), max(a, c))
+
+    face_key_groups: dict[tuple[int, ...], list[int]] = defaultdict(list)
+    for fi, (a, b, c) in enumerate(face_verts):
+        face_key_groups[tuple(sorted((a, b, c)))].append(fi)
+
+    remove_set: set[int] = set()
+    for group in face_key_groups.values():
+        if len(group) > 1:
+            for fi in group[1:]:
+                remove_set.add(fi)
+
+    for _iteration in range(200):
+        alive = [fi for fi in range(len(face_verts)) if fi not in remove_set]
+        edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for fi in alive:
+            for edge in _face_edges(fi):
+                edge_to_faces[edge].append(fi)
+
+        nm_edges = {e: fis for e, fis in edge_to_faces.items() if len(fis) > 2}
+        if not nm_edges:
+            break
+
+        manifold_count: dict[int, int] = defaultdict(int)
+        for fi in alive:
+            for edge in _face_edges(fi):
+                if len(edge_to_faces[edge]) == 2:
+                    manifold_count[fi] += 1
+
+        votes_to_remove: dict[int, int] = defaultdict(int)
+        for edge, face_indices in nm_edges.items():
+            ranked = sorted(face_indices, key=lambda fi: manifold_count.get(fi, 0), reverse=True)
+            for fi in ranked[2:]:
+                votes_to_remove[fi] += 1
+
+        if not votes_to_remove:
+            break
+
+        removed_this_round: set[int] = set()
+        for fi in sorted(votes_to_remove, key=lambda fi: votes_to_remove[fi], reverse=True):
+            if fi in removed_this_round:
+                continue
+            removed_this_round.add(fi)
+
+        remove_set.update(removed_this_round)
+
+    if not remove_set:
+        return surface
+
+    kept_faces = [face_verts[fi] for fi in range(len(face_verts)) if fi not in remove_set]
+    if not kept_faces:
+        return pv.PolyData()
+
+    new_faces: list[int] = []
+    for a, b, c in kept_faces:
+        new_faces.extend([3, a, b, c])
+
+    return pv.PolyData(points.copy(), faces=np.array(new_faces, dtype=np.int64)).clean().triangulate()
+
+
+def extract_naked_edge_loops(surface: pv.PolyData, tolerance: float) -> tuple[pv.PolyData, list[np.ndarray]]:
+    if surface.n_points == 0:
+        return pv.PolyData(), []
+    boundary_edges = surface.extract_feature_edges(
+        boundary_edges=True,
+        feature_edges=False,
+        manifold_edges=False,
+        non_manifold_edges=False,
+    ).clean()
+    polylines = _extract_polylines(boundary_edges, tolerance=tolerance)
+    return build_polyline_mesh(polylines), polylines
+
+
+def clean_meshes_without_naked_edges(
+    meshes: list[pv.PolyData],
+    tolerance: float,
+) -> MeshCleanupResult:
+    kept_meshes: list[pv.PolyData] = []
+    kept_surface_meshes: list[pv.PolyData] = []
+    kept_indices: list[int] = []
+    removed_indices: list[int] = []
+    naked_edge_meshes: list[pv.PolyData] = []
+    naked_edge_loops_by_mesh: list[tuple[np.ndarray, ...]] = []
+
+    for index, mesh in enumerate(meshes):
+        surface = extract_surface_mesh(mesh)
+        if _should_remove_cell_surface(surface, tolerance=tolerance):
+            removed_indices.append(index)
+            continue
+        naked_edge_mesh, naked_edge_loops = extract_naked_edge_loops(surface, tolerance=tolerance)
+        if not naked_edge_loops:
+            removed_indices.append(index)
+            continue
+        kept_meshes.append(mesh)
+        kept_surface_meshes.append(surface)
+        kept_indices.append(index)
+        naked_edge_meshes.append(naked_edge_mesh)
+        naked_edge_loops_by_mesh.append(tuple(naked_edge_loops))
+
+    return MeshCleanupResult(
+        kept_meshes=tuple(kept_meshes),
+        kept_surface_meshes=tuple(kept_surface_meshes),
+        kept_indices=tuple(kept_indices),
+        removed_indices=tuple(removed_indices),
+        naked_edge_meshes=tuple(naked_edge_meshes),
+        naked_edge_loops_by_mesh=tuple(naked_edge_loops_by_mesh),
+    )
+
+
+def _should_remove_cell_surface(surface: pv.PolyData, tolerance: float) -> bool:
+    if surface.n_points == 0 or surface.n_cells == 0:
+        return True
+
+    boundary_edges = surface.extract_feature_edges(
+        boundary_edges=True,
+        feature_edges=False,
+        manifold_edges=False,
+        non_manifold_edges=False,
+    ).clean()
+    boundary_edge_count = int(boundary_edges.n_cells)
+
+    non_manifold_edges = surface.extract_feature_edges(
+        boundary_edges=False,
+        feature_edges=False,
+        manifold_edges=False,
+        non_manifold_edges=True,
+    ).clean()
+    non_manifold_edge_count = int(non_manifold_edges.n_cells)
+
+    if boundary_edge_count == 0:
+        return True
+
+    if non_manifold_edge_count > 0 and boundary_edge_count == 0:
+        return True
+
+    if non_manifold_edge_count > 2 * boundary_edge_count:
+        return True
+
+    return False
+
+
+def join_two_point_segments_into_polylines(
+    segments: list[np.ndarray],
+    tolerance: float,
+) -> list[np.ndarray]:
+    if not segments:
+        return []
+
+    point_index_by_key: dict[tuple[int, int, int], int] = {}
+    canonical_points: list[np.ndarray] = []
+
+    def get_or_create_index(point: np.ndarray) -> int:
+        key = tuple(np.round(np.asarray(point, dtype=float) / tolerance).astype(int).tolist())
+        existing_index = point_index_by_key.get(key)
+        if existing_index is not None:
+            return existing_index
+        new_index = len(canonical_points)
+        point_index_by_key[key] = new_index
+        canonical_points.append(np.asarray(point, dtype=float))
+        return new_index
+
+    unique_edges: set[tuple[int, int]] = set()
+    for segment in segments:
+        if len(segment) != 2:
+            continue
+        start_index = get_or_create_index(segment[0])
+        end_index = get_or_create_index(segment[1])
+        if start_index == end_index:
+            continue
+        unique_edges.add(tuple(sorted((start_index, end_index))))
+
+    adjacency: dict[int, set[int]] = defaultdict(set)
+    for start_index, end_index in unique_edges:
+        adjacency[start_index].add(end_index)
+        adjacency[end_index].add(start_index)
+
+    unvisited_edges = set(unique_edges)
+    polylines: list[np.ndarray] = []
+
+    def pop_path(start_node: int) -> list[int]:
+        ordered_nodes = [start_node]
+        previous_node: int | None = None
+        current_node = start_node
+
+        while True:
+            next_candidates = sorted(
+                neighbor
+                for neighbor in adjacency[current_node]
+                if tuple(sorted((current_node, neighbor))) in unvisited_edges and neighbor != previous_node
+            )
+            if not next_candidates:
+                break
+            next_node = next_candidates[0]
+            unvisited_edges.remove(tuple(sorted((current_node, next_node))))
+            ordered_nodes.append(next_node)
+            previous_node, current_node = current_node, next_node
+        return ordered_nodes
+
+    endpoint_nodes = sorted(node for node, neighbors in adjacency.items() if len(neighbors) == 1)
+    for endpoint_node in endpoint_nodes:
+        has_unvisited_edge = any(
+            tuple(sorted((endpoint_node, neighbor))) in unvisited_edges
+            for neighbor in adjacency[endpoint_node]
+        )
+        if not has_unvisited_edge:
+            continue
+        ordered_nodes = pop_path(endpoint_node)
+        polylines.append(np.array([canonical_points[node] for node in ordered_nodes], dtype=float))
+
+    while unvisited_edges:
+        start_node = min(min(edge) for edge in unvisited_edges)
+        ordered_nodes = pop_path(start_node)
+        if len(ordered_nodes) > 1 and ordered_nodes[0] != ordered_nodes[-1]:
+            ordered_nodes.append(ordered_nodes[0])
+        polylines.append(np.array([canonical_points[node] for node in ordered_nodes], dtype=float))
+
+    return polylines
+
+
+def build_analysis_output_meshes(
+    analyses: tuple[CurveAnalysis, ...],
+    average_ratio: float,
+    loft_bounds: tuple[float, float, float, float, float, float],
+    tolerance: float,
+    extrusion_multiplier: float,
+    small_cell_extrusion_factor: float,
+    slice_plane_x: float | None = None,
+) -> AnalysisOutputMeshes:
+    preview_meshes: list[pv.PolyData] = []
+    output_meshes: list[pv.PolyData] = []
+    output_modes: list[str] = []
+    removed_by_retained_volume_indices: list[int] = []
+
+    for index, analysis in enumerate(analyses):
+        if analysis.ratio >= average_ratio:
+            offset_vector = extrusion_multiplier * analysis.extrusion_base_vector
+            staged_mesh, _, _ = _build_staged_offset_lofts(
+                analysis.followup_polyline,
+                center=analysis.circle_center,
+                plane_u=analysis.plane_u,
+                plane_v=analysis.plane_v,
+                offset_vector=offset_vector,
+            )
+            preview_meshes.append(staged_mesh)
+            output_meshes.append(staged_mesh)
+            output_modes.append("large")
+            continue
+
+        offset_vector = small_cell_extrusion_factor * extrusion_multiplier * analysis.extrusion_base_vector
+        moved_center = analysis.circle_center + offset_vector
+        fan_mesh = _fan_surface_from_center(moved_center, analysis.discontinuity_points)
+        if _small_mesh_exceeds_retained_volume(
+            fan_mesh,
+            loft_bounds=loft_bounds,
+            slice_plane_x=slice_plane_x,
+            tolerance=tolerance,
+        ):
+            removed_by_retained_volume_indices.append(index)
+            empty_mesh = pv.PolyData()
+            preview_meshes.append(empty_mesh)
+            output_meshes.append(empty_mesh)
+            output_modes.append("small")
+            continue
+
+        preview_meshes.append(fan_mesh)
+        output_meshes.append(fan_mesh)
+        output_modes.append("small")
+
+    return AnalysisOutputMeshes(
+        preview_meshes=tuple(preview_meshes),
+        output_meshes=tuple(output_meshes),
+        output_modes=tuple(output_modes),
+        removed_by_retained_volume_indices=tuple(removed_by_retained_volume_indices),
+    )
+
+
+def build_mesh_printability_report(mesh: pv.PolyData, tolerance: float) -> MeshPrintabilityReport:
+    surface = extract_surface_mesh(mesh)
+    boundary_edges = surface.extract_feature_edges(
+        boundary_edges=True,
+        feature_edges=False,
+        manifold_edges=False,
+        non_manifold_edges=False,
+    ).clean()
+    _, boundary_loops = extract_naked_edge_loops(surface, tolerance=tolerance)
+    non_manifold_edges = surface.extract_feature_edges(
+        boundary_edges=False,
+        feature_edges=False,
+        manifold_edges=False,
+        non_manifold_edges=True,
+    ).clean()
+    boundary_edge_count = int(boundary_edges.n_cells)
+    non_manifold_edge_count = int(non_manifold_edges.n_cells)
+    is_closed = boundary_edge_count == 0 and non_manifold_edge_count == 0
+    return MeshPrintabilityReport(
+        point_count=int(surface.n_points),
+        face_count=int(surface.n_cells),
+        connected_region_count=count_connected_regions(surface),
+        boundary_edge_count=boundary_edge_count,
+        boundary_loop_count=len(boundary_loops),
+        non_manifold_edge_count=non_manifold_edge_count,
+        is_closed=is_closed,
+        is_printable=bool(surface.n_cells > 0 and is_closed),
+    )
+
+
+def prepare_mesh_for_export(
+    mesh: pv.PolyData,
+    tolerance: float,
+    attempt_repair: bool = True,
+) -> MeshPreparationResult:
+    surface = extract_surface_mesh(mesh)
+    initial_report = build_mesh_printability_report(surface, tolerance=tolerance)
+    if initial_report.is_printable or not attempt_repair:
+        return MeshPreparationResult(
+            mesh=surface,
+            initial_report=initial_report,
+            final_report=initial_report,
+            repair_attempted=False,
+            repair_method=None,
+        )
+
+    closed = close_mesh_boundaries(surface, tolerance=tolerance)
+    closed_report = build_mesh_printability_report(closed, tolerance=tolerance)
+    if closed_report.is_printable:
+        return MeshPreparationResult(
+            mesh=closed,
+            initial_report=initial_report,
+            final_report=closed_report,
+            repair_attempted=True,
+            repair_method="close_mesh_boundaries",
+        )
+
+    if importlib.util.find_spec("pymeshfix") is not None:
+        from pymeshfix import MeshFix
+
+        pymeshfix_input = closed.triangulate().clean()
+        if pymeshfix_input.n_cells > 0:
+            faces_array = pymeshfix_input.faces.reshape((-1, 4))[:, 1:]
+            meshfix = MeshFix(pymeshfix_input.points.copy(), faces_array.copy())
+            meshfix.repair(joincomp=True, remove_smallest_components=False)
+            repaired_faces = np.hstack(
+                [
+                    np.full((len(meshfix.faces), 1), 3, dtype=np.int64),
+                    np.asarray(meshfix.faces, dtype=np.int64),
+                ]
+            ).ravel()
+            repaired_mesh = pv.PolyData(
+                np.asarray(meshfix.points, dtype=float), faces=repaired_faces,
+            ).triangulate().clean()
+            repaired_report = build_mesh_printability_report(repaired_mesh, tolerance=tolerance)
+            if repaired_report.is_printable and _repair_preserves_shape(surface, repaired_mesh):
+                return MeshPreparationResult(
+                    mesh=repaired_mesh,
+                    initial_report=initial_report,
+                    final_report=repaired_report,
+                    repair_attempted=True,
+                    repair_method="pymeshfix",
+                )
+
+    best_mesh, best_report = closed, closed_report
+    if _repair_quality_score(initial_report) > _repair_quality_score(closed_report):
+        best_mesh, best_report = surface, initial_report
+
+    return MeshPreparationResult(
+        mesh=best_mesh,
+        initial_report=initial_report,
+        final_report=best_report,
+        repair_attempted=True,
+        repair_method="close_mesh_boundaries_partial",
+    )
+
+
+def export_mesh_to_stl(
+    mesh: pv.PolyData,
+    output_path: str | Path,
+    tolerance: float,
+    attempt_repair: bool = True,
+) -> Path:
+    if mesh.n_points == 0 or mesh.n_cells == 0:
+        raise ValueError("Cannot export an empty mesh to STL.")
+    preparation = prepare_mesh_for_export(
+        mesh,
+        tolerance=tolerance,
+        attempt_repair=attempt_repair,
+    )
+    if not preparation.final_report.is_printable:
+        raise ValueError(
+            "Mesh is not closed after export preparation. "
+            f"Boundary loops: {preparation.final_report.boundary_loop_count}, "
+            f"boundary edges: {preparation.final_report.boundary_edge_count}, "
+            f"non-manifold edges: {preparation.final_report.non_manifold_edge_count}."
+        )
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    preparation.mesh.save(str(output))
+    return output
+
+
 def make_bounding_box(bounds: tuple[float, float, float, float, float, float]) -> pv.PolyData:
     return pv.Box(bounds=bounds)
+
+
+def _mesh_diagonal_length(bounds: tuple[float, float, float, float, float, float]) -> float:
+    spans = np.array(
+        [
+            bounds[1] - bounds[0],
+            bounds[3] - bounds[2],
+            bounds[5] - bounds[4],
+        ],
+        dtype=float,
+    )
+    return float(np.linalg.norm(spans))
+
+
+def _repair_preserves_shape(original_mesh: pv.PolyData, repaired_mesh: pv.PolyData) -> bool:
+    original_bounds = np.array(original_mesh.bounds, dtype=float)
+    repaired_bounds = np.array(repaired_mesh.bounds, dtype=float)
+    diagonal = max(_mesh_diagonal_length(tuple(original_bounds.tolist())), 1e-9)
+    max_bound_shift = float(np.max(np.abs(original_bounds - repaired_bounds)))
+    if max_bound_shift > 0.01 * diagonal:
+        return False
+
+    original_area = float(original_mesh.area)
+    repaired_area = float(repaired_mesh.area)
+    if original_area <= 1e-9:
+        return True
+    area_ratio = repaired_area / original_area
+    return 0.9 <= area_ratio <= 1.1
+
+
+def close_mesh_boundaries(
+    mesh: pv.PolyData,
+    tolerance: float,
+    max_iterations: int = 6,
+) -> pv.PolyData:
+    mesh = resolve_non_manifold_faces(mesh)
+
+    for _ in range(max_iterations):
+        report = build_mesh_printability_report(mesh, tolerance=tolerance)
+        if report.is_closed:
+            return mesh
+
+        surface = extract_surface_mesh(mesh)
+        _, simple_loops = extract_naked_edge_loops(surface, tolerance=tolerance)
+        if simple_loops:
+            caps = [
+                _fan_surface_from_center(
+                    loop[:-1].mean(axis=0) if np.allclose(loop[0], loop[-1], atol=tolerance) else loop.mean(axis=0),
+                    loop[:-1] if np.allclose(loop[0], loop[-1], atol=tolerance) else loop,
+                )
+                for loop in simple_loops
+                if len(loop) >= 4
+            ]
+            if caps:
+                mesh = _merge_meshes([mesh] + [c for c in caps if c.n_cells > 0])
+                mesh = resolve_non_manifold_faces(mesh)
+
+        report = build_mesh_printability_report(mesh, tolerance=tolerance)
+        if report.is_closed:
+            return mesh
+
+        branch_loops = _split_branch_boundaries(mesh, tolerance=tolerance)
+        if branch_loops:
+            branch_caps = [
+                _fan_surface_from_center(loop.mean(axis=0), loop)
+                for loop in branch_loops
+                if len(loop) >= 3
+            ]
+            if branch_caps:
+                mesh = _merge_meshes([mesh] + [c for c in branch_caps if c.n_cells > 0])
+                mesh = resolve_non_manifold_faces(mesh)
+
+        if report.boundary_edge_count > 0:
+            mesh = mesh.fill_holes(
+                hole_size=_mesh_diagonal_length(mesh.bounds) * 2.0,
+            ).triangulate().clean()
+            mesh = resolve_non_manifold_faces(mesh)
+
+    return mesh
+
+
+def _split_branch_boundaries(
+    mesh: pv.PolyData,
+    tolerance: float,
+) -> list[np.ndarray]:
+    surface = extract_surface_mesh(mesh)
+    if surface.n_points == 0:
+        return []
+
+    boundary = surface.extract_feature_edges(
+        boundary_edges=True,
+        feature_edges=False,
+        manifold_edges=False,
+        non_manifold_edges=False,
+    ).clean()
+    if boundary.n_cells == 0:
+        return []
+
+    surf_pts = np.asarray(surface.points, dtype=float)
+    bnd_pts = np.asarray(boundary.points, dtype=float)
+
+    bnd_to_surf: dict[int, int] = {}
+    for bi in range(len(bnd_pts)):
+        dists = np.linalg.norm(surf_pts - bnd_pts[bi], axis=1)
+        bnd_to_surf[bi] = int(np.argmin(dists))
+
+    adj: dict[int, set[int]] = defaultdict(set)
+    raw_lines = np.asarray(boundary.lines, dtype=int)
+    cursor = 0
+    while cursor < len(raw_lines):
+        n = int(raw_lines[cursor])
+        ids = raw_lines[cursor + 1 : cursor + 1 + n]
+        for a, b in zip(ids[:-1], ids[1:]):
+            sa, sb = bnd_to_surf[int(a)], bnd_to_surf[int(b)]
+            adj[sa].add(sb)
+            adj[sb].add(sa)
+        cursor += n + 1
+
+    branch_verts = {v for v, nbrs in adj.items() if len(nbrs) == 4}
+    if not branch_verts:
+        return []
+
+    next_id = max(adj.keys()) + 1
+    split_adj: dict[int, set[int]] = defaultdict(set)
+    for v, nbrs in adj.items():
+        if v not in branch_verts:
+            for n in nbrs:
+                split_adj[v].add(n)
+
+    split_positions: dict[int, np.ndarray] = {}
+    for v in adj:
+        split_positions[v] = surf_pts[v]
+
+    for bv in branch_verts:
+        nbrs = sorted(adj[bv])
+        bv_pos = surf_pts[bv]
+        dirs = [surf_pts[n] - bv_pos for n in nbrs]
+        norms = [np.linalg.norm(d) for d in dirs]
+        unit_dirs = [d / max(n, 1e-12) for d, n in zip(dirs, norms)]
+
+        best_score = -np.inf
+        best_pairing: tuple[tuple[int, int], tuple[int, int]] | None = None
+        for i in range(4):
+            for j in range(i + 1, 4):
+                others = [k for k in range(4) if k != i and k != j]
+                score = -(float(np.dot(unit_dirs[i], unit_dirs[j])) + float(np.dot(unit_dirs[others[0]], unit_dirs[others[1]])))
+                if score > best_score:
+                    best_score = score
+                    best_pairing = ((nbrs[i], nbrs[j]), (nbrs[others[0]], nbrs[others[1]]))
+
+        if best_pairing is None:
+            continue
+
+        (a1, a2), (b1, b2) = best_pairing
+        id_a = bv
+        id_b = next_id
+        next_id += 1
+
+        split_positions[id_a] = bv_pos.copy()
+        split_positions[id_b] = bv_pos.copy()
+
+        for n in [a1, a2]:
+            split_adj[id_a].add(n)
+            split_adj[n].discard(bv)
+            split_adj[n].add(id_a)
+        for n in [b1, b2]:
+            split_adj[id_b].add(n)
+            split_adj[n].discard(bv)
+            split_adj[n].add(id_b)
+
+    visited: set[int] = set()
+    loops: list[np.ndarray] = []
+
+    for start_v in sorted(split_adj.keys()):
+        if start_v in visited:
+            continue
+        if len(split_adj[start_v]) != 2:
+            continue
+
+        path = [start_v]
+        visited.add(start_v)
+        current = start_v
+        prev = -1
+
+        for _ in range(len(split_adj) + 10):
+            nbrs = sorted(split_adj[current])
+            candidates = [n for n in nbrs if n != prev]
+            if not candidates:
+                break
+            next_v = candidates[0]
+
+            if next_v == start_v and len(path) >= 3:
+                loop_pts = np.array([split_positions[v] for v in path], dtype=float)
+                loops.append(loop_pts)
+                break
+
+            if next_v in visited:
+                break
+
+            visited.add(next_v)
+            path.append(next_v)
+            prev = current
+            current = next_v
+
+    return loops
+
+
+def filter_closed_meshes(
+    meshes: list[pv.PolyData],
+) -> tuple[list[pv.PolyData], list[int], list[int]]:
+    kept: list[pv.PolyData] = []
+    kept_indices: list[int] = []
+    removed_indices: list[int] = []
+    for index, mesh in enumerate(meshes):
+        if mesh.n_points == 0 or mesh.n_cells == 0:
+            removed_indices.append(index)
+            continue
+        surface = extract_surface_mesh(mesh)
+        boundary = surface.extract_feature_edges(
+            boundary_edges=True,
+            feature_edges=False,
+            manifold_edges=False,
+            non_manifold_edges=False,
+        ).clean()
+        if int(boundary.n_cells) == 0:
+            removed_indices.append(index)
+            continue
+        kept.append(mesh)
+        kept_indices.append(index)
+    return kept, kept_indices, removed_indices
+
+
+def _pick_best_candidate(
+    candidates: list[tuple[pv.PolyData, MeshPrintabilityReport]],
+) -> tuple[pv.PolyData, MeshPrintabilityReport]:
+    best_mesh, best_report = candidates[0]
+    best_score = _repair_quality_score(best_report)
+    for mesh, report in candidates[1:]:
+        score = _repair_quality_score(report)
+        if score > best_score:
+            best_mesh, best_report = mesh, report
+            best_score = score
+    return best_mesh, best_report
+
+
+def _repair_quality_score(report: MeshPrintabilityReport, original_face_count: int = 1) -> float:
+    retention = report.face_count / max(original_face_count, 1)
+    if retention < 0.5:
+        return -1e9
+    if report.is_printable:
+        return 1e9 + report.face_count
+    score = float(report.face_count)
+    score -= 100.0 * report.non_manifold_edge_count
+    score -= 50.0 * report.boundary_edge_count
+    return score
 
 
 def rebuild_polylines_from_discontinuities(
@@ -357,16 +1170,11 @@ def analyze_and_generate_surfaces(
             generated_surface=empty,
             larger_surface=empty,
             smaller_surface=empty,
-            uniform_cap_surface=empty,
-            scaled_uniform_cap_surface=empty,
-            uniform_cap_edge_loft_surface=empty,
-            uniform_cap_closed_surface=empty,
         )
 
     average_ratio = float(np.mean([analysis.ratio for analysis in analyses]))
     larger_meshes: list[pv.PolyData] = []
     smaller_meshes: list[pv.PolyData] = []
-    uniform_cap_meshes: list[pv.PolyData] = []
 
     for analysis in analyses:
         if analysis.ratio >= average_ratio:
@@ -392,47 +1200,9 @@ def analyze_and_generate_surfaces(
                 continue
             smaller_meshes.append(small_mesh)
 
-        uniform_cap_offset = small_cell_extrusion_factor * extrusion_multiplier * analysis.extrusion_base_vector
-        uniform_cap_center = analysis.circle_center + uniform_cap_offset
-        uniform_cap_mesh = _fan_surface_from_center(uniform_cap_center, analysis.discontinuity_points)
-        if _small_mesh_exceeds_retained_volume(
-            uniform_cap_mesh,
-            loft_bounds=loft_bounds,
-            slice_plane_x=slice_plane_x,
-            tolerance=tolerance,
-        ):
-            continue
-        uniform_cap_meshes.append(uniform_cap_mesh)
-
     larger_surface = _merge_meshes(larger_meshes)
     smaller_surface = _merge_meshes(smaller_meshes)
     generated_surface = _merge_meshes([mesh for mesh in [larger_surface, smaller_surface] if mesh.n_cells > 0])
-    uniform_cap_surface = _merge_meshes(uniform_cap_meshes)
-    scaled_uniform_cap_surface = _scale_mesh_xy(
-        uniform_cap_surface,
-        origin=scale_origin,
-        scale_x=scale_x,
-        scale_y=scale_y,
-    )
-    uniform_cap_edge_loft_surface = _loft_naked_edges_between_meshes(
-        uniform_cap_surface,
-        scaled_uniform_cap_surface,
-        scale_origin=scale_origin,
-        planar_scale_factors=planar_scale_factors,
-        tolerance=tolerance,
-    )
-    # Keep the experimental closure path separate so it can run alongside the current large/small logic.
-    uniform_cap_closed_surface = _merge_meshes(
-        [
-            mesh
-            for mesh in [
-                uniform_cap_surface,
-                scaled_uniform_cap_surface,
-                uniform_cap_edge_loft_surface,
-            ]
-            if mesh.n_cells > 0
-        ]
-    )
 
     return SurfaceGenerationResult(
         analyses=tuple(analyses),
@@ -441,10 +1211,6 @@ def analyze_and_generate_surfaces(
         generated_surface=generated_surface,
         larger_surface=larger_surface,
         smaller_surface=smaller_surface,
-        uniform_cap_surface=uniform_cap_surface,
-        scaled_uniform_cap_surface=scaled_uniform_cap_surface,
-        uniform_cap_edge_loft_surface=uniform_cap_edge_loft_surface,
-        uniform_cap_closed_surface=uniform_cap_closed_surface,
     )
 
 
@@ -1035,31 +1801,6 @@ def _scale_and_offset_polyline(
     return np.vstack([moved_points, moved_points[0]])
 
 
-def _scale_points_xy(
-    points: np.ndarray,
-    origin: np.ndarray,
-    scale_x: float,
-    scale_y: float,
-) -> np.ndarray:
-    scaled_points = np.array(points, dtype=float, copy=True)
-    scaled_points[:, 0] = origin[0] + scale_x * (scaled_points[:, 0] - origin[0])
-    scaled_points[:, 1] = origin[1] + scale_y * (scaled_points[:, 1] - origin[1])
-    return scaled_points
-
-
-def _scale_mesh_xy(
-    mesh: pv.PolyData,
-    origin: np.ndarray,
-    scale_x: float,
-    scale_y: float,
-) -> pv.PolyData:
-    if mesh.n_points == 0:
-        return pv.PolyData()
-    scaled_mesh = mesh.copy(deep=True)
-    scaled_mesh.points = _scale_points_xy(scaled_mesh.points, origin=origin, scale_x=scale_x, scale_y=scale_y)
-    return scaled_mesh
-
-
 def _build_staged_offset_lofts(
     polyline: np.ndarray,
     center: np.ndarray,
@@ -1147,117 +1888,63 @@ def _fan_surface_from_center(center: np.ndarray, polygon_points: np.ndarray) -> 
     return pv.PolyData(points, faces=np.array(faces, dtype=np.int64)).triangulate().clean()
 
 
-def _extract_naked_edge_polylines(mesh: pv.PolyData, tolerance: float) -> list[np.ndarray]:
-    if mesh.n_points == 0:
-        return []
-    naked_edges = mesh.extract_feature_edges(
-        boundary_edges=True,
-        non_manifold_edges=False,
-        feature_edges=False,
-        manifold_edges=False,
-    )
-    if naked_edges.n_points == 0 or naked_edges.n_lines == 0:
-        return []
-    return _extract_polylines(naked_edges.clean(), tolerance=tolerance)
+def _fix_mesh_winding(mesh: pv.PolyData) -> pv.PolyData:
+    if mesh.n_cells < 2:
+        return mesh
+
+    points = np.asarray(mesh.points, dtype=float)
+    faces_raw = np.asarray(mesh.faces, dtype=int)
+    face_verts: list[list[int]] = []
+    cursor = 0
+    while cursor < len(faces_raw):
+        n = int(faces_raw[cursor])
+        if n == 3:
+            face_verts.append([int(faces_raw[cursor + 1]), int(faces_raw[cursor + 2]), int(faces_raw[cursor + 3])])
+        cursor += n + 1
+
+    if not face_verts:
+        return mesh
+
+    normals: list[np.ndarray] = []
+    for a, b, c in face_verts:
+        e1 = points[b] - points[a]
+        e2 = points[c] - points[a]
+        n = np.cross(e1, e2)
+        length = float(np.linalg.norm(n))
+        normals.append(n / length if length > 1e-12 else np.zeros(3))
+
+    avg_normal = np.mean(normals, axis=0)
+    avg_len = float(np.linalg.norm(avg_normal))
+    if avg_len < 1e-12:
+        return mesh
+    avg_normal /= avg_len
+
+    changed = False
+    for fi in range(len(face_verts)):
+        if float(np.dot(normals[fi], avg_normal)) < 0:
+            face_verts[fi][1], face_verts[fi][2] = face_verts[fi][2], face_verts[fi][1]
+            changed = True
+
+    if not changed:
+        return mesh
+
+    new_faces: list[int] = []
+    for a, b, c in face_verts:
+        new_faces.extend([3, a, b, c])
+    return pv.PolyData(points.copy(), faces=np.array(new_faces, dtype=np.int64))
 
 
-def _resample_closed_polyline(polyline: np.ndarray, sample_count: int, tolerance: float) -> np.ndarray:
-    unique_points = _unique_polyline_points(_sanitize_closed_polyline(polyline, tolerance=tolerance), tolerance=tolerance)
-    if len(unique_points) < 3 or sample_count < 3:
-        return np.zeros((0, 3), dtype=float)
-    if len(unique_points) == sample_count:
-        return _close_polyline(unique_points, tolerance=tolerance)
+def _sort_polygon_by_angle(center: np.ndarray, polygon_points: np.ndarray) -> np.ndarray:
+    if len(polygon_points) < 3:
+        return polygon_points
 
-    next_points = np.roll(unique_points, -1, axis=0)
-    segment_vectors = next_points - unique_points
-    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
-    total_length = float(segment_lengths.sum())
-    if total_length <= tolerance:
-        return _close_polyline(unique_points, tolerance=tolerance)
+    _, plane_u, plane_v, _ = _fit_plane(polygon_points)
+    centered = polygon_points - center
+    u_coords = centered @ plane_u
+    v_coords = centered @ plane_v
+    angles = np.arctan2(v_coords, u_coords)
+    return polygon_points[np.argsort(angles)]
 
-    cumulative_lengths = np.concatenate(([0.0], np.cumsum(segment_lengths)))
-    targets = np.linspace(0.0, total_length, sample_count, endpoint=False)
-    resampled_points: list[np.ndarray] = []
-    for target in targets:
-        segment_index = int(np.searchsorted(cumulative_lengths, target, side="right") - 1)
-        segment_index = min(segment_index, len(unique_points) - 1)
-        segment_start = unique_points[segment_index]
-        segment_end = unique_points[(segment_index + 1) % len(unique_points)]
-        segment_length = segment_lengths[segment_index]
-        if segment_length <= tolerance:
-            resampled_points.append(segment_start)
-            continue
-        local_distance = target - cumulative_lengths[segment_index]
-        interpolation = local_distance / segment_length
-        resampled_points.append(segment_start + interpolation * (segment_end - segment_start))
-
-    return _close_polyline(np.array(resampled_points, dtype=float), tolerance=tolerance)
-
-
-def _match_scaled_polyline_pairs(
-    first_polylines: list[np.ndarray],
-    second_polylines: list[np.ndarray],
-    scale_origin: np.ndarray,
-    planar_scale_factors: tuple[float, float],
-) -> list[tuple[int, int]]:
-    if not first_polylines or not second_polylines:
-        return []
-
-    scale_x, scale_y = planar_scale_factors
-    expected_centers = [
-        _scale_points_xy(polyline[:-1].mean(axis=0, keepdims=True), origin=scale_origin, scale_x=scale_x, scale_y=scale_y)[0]
-        for polyline in first_polylines
-    ]
-    available_indices = set(range(len(second_polylines)))
-    pairings: list[tuple[int, int]] = []
-    for first_index, expected_center in enumerate(expected_centers):
-        if not available_indices:
-            break
-        second_index = min(
-            available_indices,
-            key=lambda candidate_index: float(
-                np.linalg.norm(second_polylines[candidate_index][:-1].mean(axis=0) - expected_center)
-            ),
-        )
-        available_indices.remove(second_index)
-        pairings.append((first_index, second_index))
-    return pairings
-
-
-def _loft_naked_edges_between_meshes(
-    first_mesh: pv.PolyData,
-    second_mesh: pv.PolyData,
-    scale_origin: np.ndarray,
-    planar_scale_factors: tuple[float, float],
-    tolerance: float,
-) -> pv.PolyData:
-    if first_mesh.n_points == 0 or second_mesh.n_points == 0:
-        return pv.PolyData()
-
-    first_polylines = _extract_naked_edge_polylines(first_mesh, tolerance=tolerance)
-    second_polylines = _extract_naked_edge_polylines(second_mesh, tolerance=tolerance)
-    if not first_polylines or not second_polylines:
-        return pv.PolyData()
-
-    loft_meshes: list[pv.PolyData] = []
-    for first_index, second_index in _match_scaled_polyline_pairs(
-        first_polylines,
-        second_polylines,
-        scale_origin=scale_origin,
-        planar_scale_factors=planar_scale_factors,
-    ):
-        first_polyline = _sanitize_closed_polyline(first_polylines[first_index], tolerance=tolerance)
-        second_polyline = _sanitize_closed_polyline(second_polylines[second_index], tolerance=tolerance)
-        first_count = len(_unique_polyline_points(first_polyline, tolerance=tolerance))
-        second_count = len(_unique_polyline_points(second_polyline, tolerance=tolerance))
-        sample_count = max(first_count, second_count)
-        first_resampled = _resample_closed_polyline(first_polyline, sample_count=sample_count, tolerance=tolerance)
-        second_resampled = _resample_closed_polyline(second_polyline, sample_count=sample_count, tolerance=tolerance)
-        if len(first_resampled) == 0 or len(second_resampled) == 0:
-            continue
-        loft_meshes.append(_loft_between_polylines(first_resampled, second_resampled))
-
-    return _merge_meshes(loft_meshes)
 
 
 def _merge_meshes(meshes: list[pv.PolyData]) -> pv.PolyData:
