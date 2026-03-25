@@ -254,6 +254,87 @@ def intersect_cells_with_surface(
     return unique_polylines
 
 
+def intersect_mesh_with_plane(
+    mesh: pv.PolyData,
+    normal: tuple[float, float, float],
+    origin: tuple[float, float, float] | None = None,
+    tolerance: float = 1e-4,
+) -> list[np.ndarray]:
+    if mesh.n_points == 0 or mesh.n_cells == 0:
+        return []
+    clip_origin = origin or (0.0, 0.0, 0.0)
+    sliced = mesh.slice(normal=normal, origin=clip_origin)
+    if sliced.n_points == 0:
+        return []
+    return _extract_polylines(sliced, tolerance=tolerance)
+
+
+def filter_segments_against_curves(
+    segments: list[np.ndarray],
+    reference_curves: list[np.ndarray],
+    tolerance: float,
+) -> list[np.ndarray]:
+    if not segments or not reference_curves:
+        return segments
+
+    ref_keys: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
+    for curve in reference_curves:
+        for si in range(len(curve) - 1):
+            p1 = tuple(np.round(curve[si] / tolerance).astype(int).tolist())
+            p2 = tuple(np.round(curve[si + 1] / tolerance).astype(int).tolist())
+            ref_keys.add((min(p1, p2), max(p1, p2)))
+
+    kept: list[np.ndarray] = []
+    for seg in segments:
+        if len(seg) != 2:
+            kept.append(seg)
+            continue
+        s1 = tuple(np.round(seg[0] / tolerance).astype(int).tolist())
+        s2 = tuple(np.round(seg[1] / tolerance).astype(int).tolist())
+        seg_key = (min(s1, s2), max(s1, s2))
+        if seg_key not in ref_keys:
+            kept.append(seg)
+
+    return kept
+
+
+def filter_naked_loops_against_base_polylines(
+    naked_loops: list[np.ndarray],
+    base_polylines: list[np.ndarray],
+    tolerance: float,
+    overlap_threshold: float = 0.3,
+) -> list[np.ndarray]:
+    if not naked_loops or not base_polylines:
+        return naked_loops
+
+    base_keys: set[tuple[int, ...]] = set()
+    for polyline in base_polylines:
+        for pt in polyline:
+            base_keys.add(tuple(np.round(pt / tolerance).astype(int).tolist()))
+
+    kept: list[np.ndarray] = []
+    for loop in naked_loops:
+        loop_pts = loop[:-1] if len(loop) > 1 and np.allclose(loop[0], loop[-1], atol=tolerance) else loop
+        if len(loop_pts) == 0:
+            continue
+        matching = sum(
+            1 for pt in loop_pts
+            if tuple(np.round(pt / tolerance).astype(int).tolist()) in base_keys
+        )
+        overlap = matching / max(len(loop_pts), 1)
+        if overlap < overlap_threshold:
+            kept.append(loop)
+
+    return kept
+
+
+def weld_mesh_vertices(mesh: pv.PolyData, tolerance: float | None = None) -> pv.PolyData:
+    if mesh.n_points == 0:
+        return mesh
+    cleaned = mesh.clean(tolerance=tolerance) if tolerance is not None else mesh.clean()
+    return cleaned.triangulate()
+
+
 def build_polyline_mesh(polylines: list[np.ndarray]) -> pv.PolyData:
     if not polylines:
         return pv.PolyData()
@@ -1117,6 +1198,9 @@ def analyze_and_generate_surfaces(
 
         plane_origin, plane_u, plane_v, plane_normal = _fit_plane(unique_points)
         circle_center, circle_radius = _fit_circle_on_plane(unique_points, plane_origin, plane_u, plane_v)
+        circle_center = _ensure_center_inside_polygon(
+            circle_center, unique_points, plane_origin, plane_u, plane_v,
+        )
         bbox_mesh, bbox_center, bbox_volume = _build_plane_aligned_bounding_box(
             unique_points,
             plane_origin,
@@ -1662,6 +1746,74 @@ def _fit_plane(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, 
     plane_normal = np.cross(plane_u, plane_v)
     plane_normal /= np.linalg.norm(plane_normal)
     return plane_origin, plane_u, plane_v, plane_normal
+
+
+def _ensure_center_inside_polygon(
+    center_3d: np.ndarray,
+    polygon_points: np.ndarray,
+    plane_origin: np.ndarray,
+    plane_u: np.ndarray,
+    plane_v: np.ndarray,
+) -> np.ndarray:
+    poly_2d = _project_to_plane(polygon_points, plane_origin, plane_u, plane_v)
+    center_2d = _project_to_plane(center_3d[None, :], plane_origin, plane_u, plane_v)[0]
+
+    if _point_in_polygon_2d(center_2d, poly_2d):
+        return center_3d
+
+    fallback_2d = _ear_clip_centroid(poly_2d)
+    return plane_origin + fallback_2d[0] * plane_u + fallback_2d[1] * plane_v
+
+
+def _point_in_polygon_2d(point: np.ndarray, polygon: np.ndarray) -> bool:
+    x, y = float(point[0]), float(point[1])
+    n = len(polygon)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = float(polygon[i, 0]), float(polygon[i, 1])
+        xj, yj = float(polygon[j, 0]), float(polygon[j, 1])
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _ear_clip_centroid(polygon_2d: np.ndarray) -> np.ndarray:
+    pts = list(polygon_2d)
+    if len(pts) < 3:
+        return polygon_2d.mean(axis=0)
+
+    best_centroid = polygon_2d.mean(axis=0)
+    indices = list(range(len(pts)))
+
+    for _ in range(len(pts)):
+        if len(indices) < 3:
+            break
+        for i in range(len(indices)):
+            prev_i = indices[(i - 1) % len(indices)]
+            curr_i = indices[i]
+            next_i = indices[(i + 1) % len(indices)]
+
+            a = polygon_2d[prev_i]
+            b = polygon_2d[curr_i]
+            c = polygon_2d[next_i]
+
+            cross = float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+            if cross <= 0:
+                continue
+
+            centroid = (a + b + c) / 3.0
+            if _point_in_polygon_2d(centroid, polygon_2d):
+                return centroid
+
+            indices.pop(i)
+            best_centroid = centroid
+            break
+        else:
+            break
+
+    return best_centroid
 
 
 def _fit_circle_on_plane(
