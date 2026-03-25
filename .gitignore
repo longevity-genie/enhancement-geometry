@@ -209,5 +209,9 @@ __marimo__/
 # cursor
 .cursor/
 
-#exports
+# Exports and generated geometry
 exports/
+*.stl
+*.obj
+*.ply
+configs/
