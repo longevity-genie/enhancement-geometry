@@ -14,6 +14,9 @@ from scipy.spatial import ConvexHull, HalfspaceIntersection
 MIN_RADIUS = 5.0
 MAX_RADIUS = 75.0
 MAX_MODEL_SPAN = 150.0
+EXTREME_ASPECT_RATIO_THRESHOLD = 3.0
+EXTREME_SCALE_FACTOR = 0.3
+EXTREME_EXTRUSION_FACTOR = 0.5
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,7 @@ class CurveAnalysis:
     bbox_volume: float
     curve_length: float
     ratio: float
+    bbox_aspect_ratio: float
     scaled_circle_center: np.ndarray
     extrusion_base_vector: np.ndarray
     offset_direction: np.ndarray
@@ -712,21 +716,65 @@ def build_analysis_output_meshes(
     removed_by_retained_volume_indices: list[int] = []
 
     for index, analysis in enumerate(analyses):
+        is_extreme = analysis.bbox_aspect_ratio > EXTREME_ASPECT_RATIO_THRESHOLD
+
         if analysis.ratio >= average_ratio:
             offset_vector = extrusion_multiplier * analysis.extrusion_base_vector
-            staged_mesh, _, _ = _build_staged_offset_lofts(
-                analysis.followup_polyline,
-                center=analysis.circle_center,
-                plane_u=analysis.plane_u,
-                plane_v=analysis.plane_v,
-                offset_vector=offset_vector,
-            )
-            preview_meshes.append(staged_mesh)
-            output_meshes.append(staged_mesh)
-            output_modes.append("large")
+            if is_extreme:
+                offset_vector = EXTREME_EXTRUSION_FACTOR * offset_vector
+                staged_mesh, _, _ = _build_extreme_cell_lofts(
+                    analysis.followup_polyline,
+                    center=analysis.circle_center,
+                    plane_origin=analysis.plane_origin,
+                    plane_u=analysis.plane_u,
+                    plane_v=analysis.plane_v,
+                    plane_normal=analysis.plane_normal,
+                    offset_vector=offset_vector,
+                )
+                preview_meshes.append(staged_mesh)
+                output_meshes.append(staged_mesh)
+                output_modes.append("extreme")
+            else:
+                staged_mesh, _, _ = _build_staged_offset_lofts(
+                    analysis.followup_polyline,
+                    center=analysis.circle_center,
+                    plane_u=analysis.plane_u,
+                    plane_v=analysis.plane_v,
+                    offset_vector=offset_vector,
+                )
+                preview_meshes.append(staged_mesh)
+                output_meshes.append(staged_mesh)
+                output_modes.append("large")
             continue
 
         offset_vector = small_cell_extrusion_factor * extrusion_multiplier * analysis.extrusion_base_vector
+
+        if is_extreme:
+            offset_vector = EXTREME_EXTRUSION_FACTOR * offset_vector
+            staged_mesh, _, _ = _build_extreme_cell_lofts(
+                analysis.followup_polyline,
+                center=analysis.circle_center,
+                plane_origin=analysis.plane_origin,
+                plane_u=analysis.plane_u,
+                plane_v=analysis.plane_v,
+                plane_normal=analysis.plane_normal,
+                offset_vector=offset_vector,
+            )
+            if _small_mesh_exceeds_retained_volume(
+                staged_mesh, loft_bounds=loft_bounds,
+                slice_plane_x=slice_plane_x, tolerance=tolerance,
+            ):
+                removed_by_retained_volume_indices.append(index)
+                empty_mesh = pv.PolyData()
+                preview_meshes.append(empty_mesh)
+                output_meshes.append(empty_mesh)
+                output_modes.append("extreme")
+                continue
+            preview_meshes.append(staged_mesh)
+            output_meshes.append(staged_mesh)
+            output_modes.append("extreme")
+            continue
+
         moved_center = analysis.circle_center + offset_vector
         fan_mesh = _fan_surface_from_center(moved_center, analysis.discontinuity_points)
         if _small_mesh_exceeds_retained_volume(
@@ -1293,7 +1341,7 @@ def analyze_and_generate_surfaces(
         circle_center = _ensure_center_inside_polygon(
             circle_center, unique_points, plane_origin, plane_u, plane_v,
         )
-        bbox_mesh, bbox_center, bbox_volume = _build_plane_aligned_bounding_box(
+        bbox_mesh, bbox_center, bbox_volume, bbox_extents = _build_plane_aligned_bounding_box(
             unique_points,
             plane_origin,
             plane_u,
@@ -1301,6 +1349,9 @@ def analyze_and_generate_surfaces(
             plane_normal,
             tolerance=tolerance,
         )
+        u_span, v_span, _ = bbox_extents
+        min_span = min(u_span, v_span)
+        bbox_aspect_ratio = max(u_span, v_span) / min_span if min_span > tolerance else 1.0
         curve_length = _polyline_length(followup_polyline)
         if curve_length <= tolerance:
             continue
@@ -1331,6 +1382,7 @@ def analyze_and_generate_surfaces(
                 bbox_volume=bbox_volume,
                 curve_length=curve_length,
                 ratio=bbox_volume / curve_length,
+                bbox_aspect_ratio=bbox_aspect_ratio,
                 scaled_circle_center=scaled_circle_center,
                 extrusion_base_vector=direction_vector,
                 offset_direction=offset_direction,
@@ -1353,20 +1405,46 @@ def analyze_and_generate_surfaces(
     smaller_meshes: list[pv.PolyData] = []
 
     for analysis in analyses:
+        is_extreme = analysis.bbox_aspect_ratio > EXTREME_ASPECT_RATIO_THRESHOLD
+
         if analysis.ratio >= average_ratio:
             offset_vector = extrusion_multiplier * analysis.extrusion_base_vector
-            staged_loft_mesh, _, _ = _build_staged_offset_lofts(
-                analysis.followup_polyline,
-                center=analysis.circle_center,
-                plane_u=analysis.plane_u,
-                plane_v=analysis.plane_v,
-                offset_vector=offset_vector,
-            )
+            if is_extreme:
+                offset_vector = EXTREME_EXTRUSION_FACTOR * offset_vector
+                staged_loft_mesh, _, _ = _build_extreme_cell_lofts(
+                    analysis.followup_polyline,
+                    center=analysis.circle_center,
+                    plane_origin=analysis.plane_origin,
+                    plane_u=analysis.plane_u,
+                    plane_v=analysis.plane_v,
+                    plane_normal=analysis.plane_normal,
+                    offset_vector=offset_vector,
+                )
+            else:
+                staged_loft_mesh, _, _ = _build_staged_offset_lofts(
+                    analysis.followup_polyline,
+                    center=analysis.circle_center,
+                    plane_u=analysis.plane_u,
+                    plane_v=analysis.plane_v,
+                    offset_vector=offset_vector,
+                )
             larger_meshes.append(staged_loft_mesh)
         else:
             offset_vector = small_cell_extrusion_factor * extrusion_multiplier * analysis.extrusion_base_vector
-            moved_center = analysis.circle_center + offset_vector
-            small_mesh = _fan_surface_from_center(moved_center, analysis.discontinuity_points)
+            if is_extreme:
+                offset_vector = EXTREME_EXTRUSION_FACTOR * offset_vector
+                small_mesh, _, _ = _build_extreme_cell_lofts(
+                    analysis.followup_polyline,
+                    center=analysis.circle_center,
+                    plane_origin=analysis.plane_origin,
+                    plane_u=analysis.plane_u,
+                    plane_v=analysis.plane_v,
+                    plane_normal=analysis.plane_normal,
+                    offset_vector=offset_vector,
+                )
+            else:
+                moved_center = analysis.circle_center + offset_vector
+                small_mesh = _fan_surface_from_center(moved_center, analysis.discontinuity_points)
             if _small_mesh_exceeds_retained_volume(
                 small_mesh,
                 loft_bounds=loft_bounds,
@@ -1949,7 +2027,7 @@ def _build_plane_aligned_bounding_box(
     plane_v: np.ndarray,
     plane_normal: np.ndarray,
     tolerance: float,
-) -> tuple[pv.PolyData, np.ndarray, float]:
+) -> tuple[pv.PolyData, np.ndarray, float, tuple[float, float, float]]:
     centered = points - plane_origin
     local_coordinates = np.column_stack(
         [
@@ -1994,7 +2072,8 @@ def _build_plane_aligned_bounding_box(
     bbox_center_local = 0.5 * (mins + maxs)
     bbox_center = plane_origin + bbox_center_local @ transform.T
     bbox_volume = float(np.prod(maxs - mins))
-    return bbox_mesh, bbox_center, bbox_volume
+    extents = (float(maxs[0] - mins[0]), float(maxs[1] - mins[1]), float(maxs[2] - mins[2]))
+    return bbox_mesh, bbox_center, bbox_volume, extents
 
 
 def _polyline_length(polyline: np.ndarray) -> float:
@@ -2077,6 +2156,50 @@ def _build_staged_offset_lofts(
         ]
     )
     return staged_mesh, first_scaled_polyline, second_scaled_polyline
+
+
+def _project_polyline_to_plane(
+    polyline: np.ndarray,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+) -> np.ndarray:
+    """Project each point of a polyline onto a plane, flattening any 3D undulation."""
+    vecs = polyline - plane_origin
+    dists = (vecs @ plane_normal)[:, None]
+    return polyline - dists * plane_normal
+
+
+def _build_extreme_cell_lofts(
+    polyline: np.ndarray,
+    center: np.ndarray,
+    plane_origin: np.ndarray,
+    plane_u: np.ndarray,
+    plane_v: np.ndarray,
+    plane_normal: np.ndarray,
+    offset_vector: np.ndarray,
+    primary_scale_factor: float = EXTREME_SCALE_FACTOR,
+    secondary_scale_ratio: float = 0.9,
+) -> tuple[pv.PolyData, np.ndarray, np.ndarray]:
+    """Variant of _build_staged_offset_lofts for extreme-aspect-ratio cells.
+
+    The original polyline is kept as-is (3D surface intersection); only the
+    inner scaled copies are projected onto the fitted plane to flatten them,
+    and a more aggressive scale factor is used for thicker walls.
+    """
+    first = _scale_and_offset_polyline(
+        polyline, center, plane_u, plane_v, primary_scale_factor, offset_vector,
+    )
+    first = _project_polyline_to_plane(first, plane_origin, plane_normal)
+    second = _scale_and_offset_polyline(
+        polyline, center, plane_u, plane_v,
+        primary_scale_factor * secondary_scale_ratio, offset_vector,
+    )
+    second = _project_polyline_to_plane(second, plane_origin, plane_normal)
+    staged_mesh = _merge_meshes([
+        _loft_between_polylines(polyline, first),
+        _loft_between_polylines(first, second),
+    ])
+    return staged_mesh, first, second
 
 
 def _small_mesh_exceeds_retained_volume(

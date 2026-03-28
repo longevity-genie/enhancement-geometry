@@ -104,6 +104,52 @@ Circle radius is constrained to **5–75** units.
 | Extrusion | **-3.00 to 3.00** |
 | Scale X/Y | **0.10–1.50** non-uniform XY scaling |
 
+## Geometric constraints
+
+The pipeline automatically detects and handles cells that would produce degenerate geometry. Each cell's intersection curve is analyzed with a best-fit plane and an oriented bounding box in the `(U, V, normal)` frame of that plane.
+
+### Cell classification
+
+Every cell is classified into one of three categories based on two metrics:
+
+| Metric | Definition | Purpose |
+|--------|------------|---------|
+| **Volume/length ratio** | `bbox_volume / curve_length` | Separates large cells (ratio >= population mean) from small cells |
+| **Bbox aspect ratio** | `max(u_span, v_span) / min(u_span, v_span)` | Detects elongated cells that would produce spiky geometry |
+
+Classification rules:
+
+| Category | Condition | Surface method |
+|----------|-----------|----------------|
+| **Large** | ratio >= mean AND aspect ratio <= 3.0 | Staged offset lofts (scale 0.5, then 0.45) |
+| **Small** | ratio < mean AND aspect ratio <= 3.0 | Triangle fan from offset center |
+| **Extreme** | aspect ratio > 3.0 (any ratio) | Extreme cell lofts (see below) |
+
+### Extreme cell handling
+
+When a cell's bounding box aspect ratio exceeds **3.0**, it is classified as extreme regardless of its volume/length ratio. Extreme cells get three corrections to prevent spiky, degenerate geometry:
+
+| Correction | Value | Effect |
+|------------|-------|--------|
+| **Inner curve projection** | Projected onto fitted plane | The inner scaled copies are flattened onto the cell's best-fit plane, removing 3D undulation. The original intersection curve stays untouched in 3D. |
+| **Scale factor** | **0.3** (vs 0.5 for normal large cells) | The inner curve is scaled closer to the center, producing thicker walls |
+| **Extrusion reduction** | **0.5x** normal extrusion | The offset vector is halved, preventing extreme cells from extending too far outward |
+
+The loft for extreme cells goes: original 3D curve (unchanged) -> flat inner edge (0.3 scale) -> flatter inner edge (0.27 scale). This creates a clean transition from the curved surface to a straight, thick inner wall.
+
+### Constants
+
+These values are defined in `lofted_surface_voronoi.py`:
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `EXTREME_ASPECT_RATIO_THRESHOLD` | 3.0 | Bbox aspect ratio above which a cell is classified as extreme |
+| `EXTREME_SCALE_FACTOR` | 0.3 | Inner curve scale factor for extreme cells (vs 0.5 default) |
+| `EXTREME_EXTRUSION_FACTOR` | 0.5 | Multiplier applied to the extrusion offset for extreme cells |
+| `MIN_RADIUS` | 5.0 | Minimum allowed circle radius |
+| `MAX_RADIUS` | 75.0 | Maximum allowed circle radius |
+| `MAX_MODEL_SPAN` | 150.0 | Maximum extent in any axis |
+
 ## Project structure
 
 ```
