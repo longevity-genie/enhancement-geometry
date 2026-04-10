@@ -1,12 +1,12 @@
 [project]
 name = "compass-web"
-version = "0.1.0"
+version = "0.1.2"
 description = "Generate 3D-printable voronoi shell geometry from parametric inputs."
 readme = "README.md"
 authors = [
     { name = "antonkulaga", email = "antonkulaga@gmail.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = [
     "compas>=2.15.1",
     "jupyterlab>=4.5.6",
