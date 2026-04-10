@@ -77,6 +77,13 @@ def generate(
         bool,
         typer.Option("--quiet", "-q", help="Suppress progress output."),
     ] = False,
+    apply_smoothing: Annotated[
+        bool,
+        typer.Option(
+            "--smoothing/--no-smoothing",
+            help="Apply radii/spacing smoothing before loft.",
+        ),
+    ] = True,
 ) -> None:
     """Run the full voronoi shell pipeline and export to STL."""
     from compass_web.config import (
@@ -115,13 +122,20 @@ def generate(
         from dataclasses import replace
         pipeline_config = replace(pipeline_config, seed_count=seed_count)
 
-    validate_geometry_limits(pipeline_config.radii, pipeline_config.z_increment)
+    validate_geometry_limits(
+        pipeline_config.radii,
+        pipeline_config.z_increment,
+        z_levels=pipeline_config.z_levels,
+    )
 
     if not quiet:
         typer.echo("Running voronoi shell pipeline...")
 
     result, used_config = run_pipeline_with_retry(
-        pipeline_config, max_attempts=retry, verbose=not quiet,
+        pipeline_config,
+        max_attempts=retry,
+        verbose=not quiet,
+        apply_smoothing=apply_smoothing,
     )
 
     if not result.is_valid_volume:
@@ -318,6 +332,13 @@ def run(
         bool,
         typer.Option("--quiet", "-q", help="Suppress progress output."),
     ] = False,
+    apply_smoothing: Annotated[
+        bool,
+        typer.Option(
+            "--smoothing/--no-smoothing",
+            help="Apply radii/spacing smoothing before loft.",
+        ),
+    ] = True,
 ) -> None:
     """Create a config from parameters, save it, and run the pipeline in one step."""
     from compass_web.config import save_pipeline_config
@@ -337,7 +358,9 @@ def run(
     if not quiet:
         typer.echo("Running voronoi shell pipeline...")
 
-    result, used_config = run_pipeline_with_retry(cfg, max_attempts=retry, verbose=not quiet)
+    result, used_config = run_pipeline_with_retry(
+        cfg, max_attempts=retry, verbose=not quiet, apply_smoothing=apply_smoothing,
+    )
 
     if not result.is_valid_volume:
         typer.echo("WARNING: Final mesh is not a valid volume.", err=True)

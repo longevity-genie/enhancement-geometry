@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 import importlib.util
@@ -14,9 +15,10 @@ from scipy.spatial import ConvexHull, HalfspaceIntersection
 MIN_RADIUS = 5.0
 MAX_RADIUS = 75.0
 MAX_MODEL_SPAN = 150.0
-EXTREME_ASPECT_RATIO_THRESHOLD = 3.0
+EXTREME_ASPECT_RATIO_THRESHOLD = 2.0
 EXTREME_SCALE_FACTOR = 0.3
 EXTREME_EXTRUSION_FACTOR = 0.5
+EXTREME_PLANARITY_RATIO = 0.03
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,7 @@ class CurveAnalysis:
     curve_length: float
     ratio: float
     bbox_aspect_ratio: float
+    planarity_ratio: float
     scaled_circle_center: np.ndarray
     extrusion_base_vector: np.ndarray
     offset_direction: np.ndarray
@@ -237,17 +240,24 @@ def intersect_cells_with_surface(
 
     triangulated_surface = surface.triangulate().clean()
     vtk.vtkObject.GlobalWarningDisplayOff()
-    for cell in cells:
+
+    cells_with_intersection: set[int] = set()
+
+    for ci, cell in enumerate(cells):
         if not _bounds_overlap(triangulated_surface.bounds, cell.bounds):
             continue
-        intersection, _, _ = triangulated_surface.intersection(
-            cell.triangulate().clean(),
-            split_first=False,
-            split_second=False,
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*not valid.*vtkOriginalCellIds.*")
+            intersection, _, _ = triangulated_surface.intersection(
+                cell.triangulate().clean(),
+                split_first=False,
+                split_second=False,
+            )
+            intersection = _strip_stale_cell_arrays(intersection)
         if intersection.n_points == 0 or intersection.n_lines == 0:
             continue
 
+        cells_with_intersection.add(ci)
         for polyline in _extract_polylines(intersection, tolerance=tolerance):
             polyline_key = _canonical_polyline_key(polyline, tolerance=tolerance)
             if polyline_key in seen_keys:
@@ -255,7 +265,98 @@ def intersect_cells_with_surface(
             seen_keys.add(polyline_key)
             unique_polylines.append(polyline)
 
+    uncovered = _find_uncovered_surface_patches(
+        triangulated_surface, unique_polylines, tolerance,
+    )
+    for polyline in uncovered:
+        polyline_key = _canonical_polyline_key(polyline, tolerance=tolerance)
+        if polyline_key not in seen_keys:
+            seen_keys.add(polyline_key)
+            unique_polylines.append(polyline)
+
     return unique_polylines
+
+
+def _find_uncovered_surface_patches(
+    surface: pv.PolyData,
+    existing_polylines: list[np.ndarray],
+    tolerance: float,
+) -> list[np.ndarray]:
+    """Find surface regions not near any existing intersection polyline.
+
+    A surface face is "covered" if all its vertices are within a distance
+    threshold of at least one polyline segment.  Uncovered faces form
+    patches whose boundaries become new polylines.
+    """
+    result: list[np.ndarray] = []
+    if surface.n_cells == 0 or not existing_polylines:
+        return result
+
+    surf_pts = np.asarray(surface.points, dtype=float)
+    n_verts = len(surf_pts)
+
+    all_poly_pts: list[np.ndarray] = []
+    for pl in existing_polylines:
+        u = _unique_polyline_points(pl, tolerance)
+        if len(u) > 0:
+            all_poly_pts.append(u)
+    if not all_poly_pts:
+        return result
+    poly_cloud = np.vstack(all_poly_pts)
+
+    min_dist = np.full(n_verts, float("inf"), dtype=float)
+    chunk = 500
+    for start in range(0, len(poly_cloud), chunk):
+        pc = poly_cloud[start : start + chunk]
+        d = np.linalg.norm(surf_pts[:, None, :] - pc[None, :, :], axis=2)
+        min_dist = np.minimum(min_dist, d.min(axis=1))
+
+    coverage_radius = max(tolerance * 500, 2.0)
+    uncovered_mask = min_dist > coverage_radius
+
+    if not np.any(uncovered_mask):
+        return result
+
+    face_arr = np.asarray(surface.faces, dtype=int)
+    cursor = 0
+    uncovered_face_ids: list[int] = []
+    for fi in range(surface.n_cells):
+        nv = face_arr[cursor]
+        vert_ids = face_arr[cursor + 1 : cursor + 1 + nv]
+        if np.all(uncovered_mask[vert_ids]):
+            uncovered_face_ids.append(fi)
+        cursor += nv + 1
+
+    if not uncovered_face_ids:
+        return result
+
+    uncovered_sub = surface.extract_cells(np.array(uncovered_face_ids, dtype=int))
+    if uncovered_sub.n_cells == 0:
+        return result
+    uncovered_sub = _strip_stale_cell_arrays(uncovered_sub.clean())
+
+    boundary = uncovered_sub.extract_feature_edges(
+        boundary_edges=True,
+        feature_edges=False,
+        manifold_edges=False,
+        non_manifold_edges=False,
+    ).clean()
+
+    if boundary.n_points < 3 or boundary.n_lines == 0:
+        return result
+
+    min_area = tolerance * 100
+    for polyline in _extract_polylines(boundary, tolerance=tolerance):
+        unique = _unique_polyline_points(polyline, tolerance)
+        if len(unique) < 3:
+            continue
+        po, pu, pv_vec, _ = _fit_plane(unique)
+        p2d = _project_to_plane(unique, po, pu, pv_vec)
+        area = _polygon_area_2d(p2d)
+        if area > min_area:
+            result.append(polyline)
+
+    return result
 
 
 def intersect_mesh_with_plane(
@@ -399,7 +500,7 @@ def extract_surface_mesh(mesh: pv.PolyData) -> pv.PolyData:
         return pv.PolyData()
     surface = mesh.extract_surface(algorithm="dataset_surface").clean()
     if surface.n_cells > 0:
-        surface = surface.triangulate()
+        surface = _strip_stale_cell_arrays(surface).triangulate()
     return surface
 
 
@@ -716,7 +817,10 @@ def build_analysis_output_meshes(
     removed_by_retained_volume_indices: list[int] = []
 
     for index, analysis in enumerate(analyses):
-        is_extreme = analysis.bbox_aspect_ratio > EXTREME_ASPECT_RATIO_THRESHOLD
+        is_extreme = (
+            analysis.bbox_aspect_ratio > EXTREME_ASPECT_RATIO_THRESHOLD
+            or analysis.planarity_ratio < EXTREME_PLANARITY_RATIO
+        )
 
         if analysis.ratio >= average_ratio:
             offset_vector = extrusion_multiplier * analysis.extrusion_base_vector
@@ -748,32 +852,8 @@ def build_analysis_output_meshes(
             continue
 
         offset_vector = small_cell_extrusion_factor * extrusion_multiplier * analysis.extrusion_base_vector
-
         if is_extreme:
             offset_vector = EXTREME_EXTRUSION_FACTOR * offset_vector
-            staged_mesh, _, _ = _build_extreme_cell_lofts(
-                analysis.followup_polyline,
-                center=analysis.circle_center,
-                plane_origin=analysis.plane_origin,
-                plane_u=analysis.plane_u,
-                plane_v=analysis.plane_v,
-                plane_normal=analysis.plane_normal,
-                offset_vector=offset_vector,
-            )
-            if _small_mesh_exceeds_retained_volume(
-                staged_mesh, loft_bounds=loft_bounds,
-                slice_plane_x=slice_plane_x, tolerance=tolerance,
-            ):
-                removed_by_retained_volume_indices.append(index)
-                empty_mesh = pv.PolyData()
-                preview_meshes.append(empty_mesh)
-                output_meshes.append(empty_mesh)
-                output_modes.append("extreme")
-                continue
-            preview_meshes.append(staged_mesh)
-            output_meshes.append(staged_mesh)
-            output_modes.append("extreme")
-            continue
 
         moved_center = analysis.circle_center + offset_vector
         fan_mesh = _fan_surface_from_center(moved_center, analysis.discontinuity_points)
@@ -1147,11 +1227,28 @@ def align_loops_and_loft(
     if len(a_unique) != len(b_unique) or len(a_unique) < 2:
         return pv.PolyData()
 
-    dists = np.linalg.norm(b_unique - a_unique[0:1], axis=1)
-    offset = int(np.argmin(dists))
+    n = len(a_unique)
 
-    if offset != 0:
-        b_unique = np.roll(b_unique, -offset, axis=0)
+    def _total_dist(a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.sum(np.linalg.norm(a - b, axis=1)))
+
+    def _best_roll(a: np.ndarray, b: np.ndarray) -> tuple[int, float]:
+        best_off, best_d = 0, _total_dist(a, b)
+        for off in range(1, n):
+            d = _total_dist(a, np.roll(b, -off, axis=0))
+            if d < best_d:
+                best_d = d
+                best_off = off
+        return best_off, best_d
+
+    off_fwd, d_fwd = _best_roll(a_unique, b_unique)
+    b_rev = b_unique[::-1]
+    off_rev, d_rev = _best_roll(a_unique, b_rev)
+
+    if d_rev < d_fwd:
+        b_unique = np.roll(b_rev, -off_rev, axis=0)
+    elif off_fwd != 0:
+        b_unique = np.roll(b_unique, -off_fwd, axis=0)
 
     a_loop = np.vstack([a_unique, a_unique[0:1]])
     b_loop = np.vstack([b_unique, b_unique[0:1]])
@@ -1175,6 +1272,15 @@ def split_and_offset_plane_faces(
     offset_amount: float = -2.0,
     tolerance: float = 1e-4,
 ) -> tuple[pv.PolyData, pv.PolyData]:
+    """Split a boundary cell mesh into body and plane-face patches.
+
+    Two-run approach:
+      Run 1 — centroid check: faces whose centroid lies on the cutting plane
+              are moved as whole faces (the original method).
+      Run 2 — vertex search among remaining faces: faces where ALL vertices
+              are within a wider tolerance AND at least 2 are right on the
+              plane are flattened onto the plane, then offset.
+    """
     plane_axis = int(np.argmax(np.abs(plane_normal)))
     plane_coord = float(plane_origin[plane_axis])
 
@@ -1183,42 +1289,91 @@ def split_and_offset_plane_faces(
 
     points = np.asarray(mesh.points, dtype=float)
     faces_raw = np.asarray(mesh.faces, dtype=int)
-    face_verts: list[tuple[int, int, int]] = []
+    face_verts: list[tuple[int, ...]] = []
     cursor = 0
     while cursor < len(faces_raw):
         n = int(faces_raw[cursor])
-        if n == 3:
-            face_verts.append((int(faces_raw[cursor + 1]), int(faces_raw[cursor + 2]), int(faces_raw[cursor + 3])))
+        verts = tuple(int(faces_raw[cursor + 1 + j]) for j in range(n))
+        face_verts.append(verts)
         cursor += n + 1
 
-    plane_fi: list[int] = []
-    body_fi: list[int] = []
-    for fi, (a, b, c) in enumerate(face_verts):
-        center_on_axis = float((points[a] + points[b] + points[c])[plane_axis] / 3.0)
-        if abs(center_on_axis - plane_coord) < tolerance * 50:
-            plane_fi.append(fi)
-        else:
-            body_fi.append(fi)
+    plane_tol = tolerance * 50
+    vertex_dists = np.abs(points[:, plane_axis] - plane_coord)
 
-    if not plane_fi:
+    is_boundary = bool(np.any(vertex_dists < plane_tol))
+    if not is_boundary:
         return mesh, pv.PolyData()
 
-    body_faces: list[int] = []
-    for fi in body_fi:
-        a, b, c = face_verts[fi]
-        body_faces.extend([3, a, b, c])
-    body_mesh = pv.PolyData(points.copy(), faces=np.array(body_faces, dtype=np.int64)) if body_faces else pv.PolyData()
+    near_plane_tol = plane_tol * 5
 
-    plane_faces: list[int] = []
-    for fi in plane_fi:
-        a, b, c = face_verts[fi]
-        plane_faces.extend([3, a, b, c])
-    plane_mesh = pv.PolyData(points.copy(), faces=np.array(plane_faces, dtype=np.int64))
-    plane_mesh = plane_mesh.clean().triangulate()
+    # ------------------------------------------------------------------
+    # Run 1: centroid check — move entire face if centroid is at x ≈ 0
+    # ------------------------------------------------------------------
+    run1_faces: set[int] = set()
+    for fi, fv in enumerate(face_verts):
+        centroid_on_axis = sum(float(points[vi, plane_axis]) for vi in fv) / len(fv)
+        if abs(centroid_on_axis - plane_coord) < plane_tol:
+            run1_faces.add(fi)
 
-    moved_points = np.asarray(plane_mesh.points, dtype=float).copy()
+    # ------------------------------------------------------------------
+    # Run 2: among remaining faces, find those that can become flat
+    #   - ALL vertices within near_plane_tol of the plane
+    #   - at least 2 vertices right on the plane (within plane_tol)
+    # ------------------------------------------------------------------
+    run2_faces: set[int] = set()
+    for fi, fv in enumerate(face_verts):
+        if fi in run1_faces:
+            continue
+        all_near = all(vertex_dists[vi] < near_plane_tol for vi in fv)
+        if not all_near:
+            continue
+        on_plane_count = sum(1 for vi in fv if vertex_dists[vi] < plane_tol)
+        if on_plane_count >= 2:
+            run2_faces.add(fi)
+
+    selected_faces = run1_faces | run2_faces
+    if not selected_faces:
+        return mesh, pv.PolyData()
+
+    if len(selected_faces) == len(face_verts):
+        selected_faces = run1_faces if run1_faces else set()
+        if not selected_faces:
+            return mesh, pv.PolyData()
+
+    # ------------------------------------------------------------------
+    # Build body mesh (unselected faces, original points)
+    # ------------------------------------------------------------------
+    body_face_data: list[int] = []
+    for fi, fv in enumerate(face_verts):
+        if fi not in selected_faces:
+            body_face_data.extend([len(fv)] + [int(v) for v in fv])
+
+    body_mesh = (
+        pv.PolyData(points.copy(), faces=np.array(body_face_data, dtype=np.int64))
+        if body_face_data
+        else pv.PolyData()
+    )
+
+    # ------------------------------------------------------------------
+    # Build moved mesh
+    #   Run 1 faces: offset as-is (they are already flat on the plane)
+    #   Run 2 faces: flatten to plane first, then offset
+    # ------------------------------------------------------------------
+    moved_points = points.copy()
+    for fi in run2_faces:
+        for vi in face_verts[fi]:
+            moved_points[vi, plane_axis] = plane_coord
     moved_points[:, plane_axis] += offset_amount
-    plane_mesh.points = moved_points
+
+    plane_face_data: list[int] = []
+    for fi in sorted(selected_faces):
+        fv = face_verts[fi]
+        plane_face_data.extend([len(fv)] + [int(v) for v in fv])
+
+    plane_mesh = pv.PolyData(
+        moved_points, faces=np.array(plane_face_data, dtype=np.int64)
+    )
+    plane_mesh = plane_mesh.clean().triangulate()
 
     return body_mesh, plane_mesh
 
@@ -1273,21 +1428,241 @@ def _repair_quality_score(report: MeshPrintabilityReport, original_face_count: i
     return score
 
 
+def _signed_polygon_area_2d(pts_2d: np.ndarray) -> float:
+    """Signed area of a 2D polygon via the shoelace formula."""
+    n = len(pts_2d)
+    if n < 3:
+        return 0.0
+    x = pts_2d[:, 0]
+    y = pts_2d[:, 1]
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def _polygon_area_2d(pts_2d: np.ndarray) -> float:
+    return abs(_signed_polygon_area_2d(pts_2d))
+
+
+def _polygon_centroid_2d(pts_2d: np.ndarray) -> np.ndarray:
+    """Centroid of a simple 2D polygon."""
+    n = len(pts_2d)
+    if n < 3:
+        return pts_2d.mean(axis=0) if n > 0 else np.zeros(2)
+    sa = _signed_polygon_area_2d(pts_2d)
+    if abs(sa) < 1e-20:
+        return pts_2d.mean(axis=0)
+    x = pts_2d[:, 0]
+    y = pts_2d[:, 1]
+    xn = np.roll(x, -1)
+    yn = np.roll(y, -1)
+    cross = x * yn - xn * y
+    cx = float(np.sum((x + xn) * cross)) / (6.0 * sa)
+    cy = float(np.sum((y + yn) * cross)) / (6.0 * sa)
+    return np.array([cx, cy], dtype=float)
+
+
+def compact_polyline_shapes(
+    polylines: list[np.ndarray],
+    tolerance: float,
+    *,
+    tail_distance_ratio: float = 2.2,
+    min_area_fraction: float = 0.4,
+    min_vertices: int = 4,
+) -> tuple[list[np.ndarray], int, list[str]]:
+    """Remove tail vertices that make polyline shapes non-compact.
+
+    For each polyline the function:
+    1. Fits a best-fit plane and projects to 2D.
+    2. Computes the polygon centroid and per-vertex distance from it.
+    3. Vertices farther than ``tail_distance_ratio * median_distance`` are
+       candidates for removal.
+    4. A candidate is removed only if dropping it keeps >= *min_vertices*
+       vertices and the resulting area is >= *min_area_fraction* of the
+       original.
+
+    This trims elongated peninsulas / tails that barely contribute area
+    but extend far from the bulk of the cell.
+
+    Returns ``(compacted_polylines, total_removed, log_messages)``.
+    """
+    result: list[np.ndarray] = []
+    total_removed = 0
+    messages: list[str] = []
+
+    for ci, polyline in enumerate(polylines):
+        unique = _unique_polyline_points(polyline, tolerance)
+        if len(unique) < min_vertices:
+            result.append(polyline.copy())
+            continue
+
+        po, pu, pv, _pn = _fit_plane(unique)
+        pts_2d = _project_to_plane(unique, po, pu, pv)
+        original_area = _polygon_area_2d(pts_2d)
+
+        if original_area < 1e-12:
+            result.append(polyline.copy())
+            continue
+
+        centroid = _polygon_centroid_2d(pts_2d)
+        dists = np.linalg.norm(pts_2d - centroid, axis=1)
+        median_dist = float(np.median(dists))
+        if median_dist < 1e-12:
+            result.append(polyline.copy())
+            continue
+
+        threshold = tail_distance_ratio * median_dist
+        tail_candidates = np.where(dists > threshold)[0]
+
+        if len(tail_candidates) == 0:
+            result.append(polyline.copy())
+            continue
+
+        sorted_candidates = sorted(tail_candidates, key=lambda i: -dists[i])
+
+        keep_mask = np.ones(len(unique), dtype=bool)
+        removed_this_cell = 0
+
+        for vi in sorted_candidates:
+            if int(keep_mask.sum()) <= min_vertices:
+                break
+            test_mask = keep_mask.copy()
+            test_mask[vi] = False
+            test_pts = pts_2d[test_mask]
+            test_area = _polygon_area_2d(test_pts)
+
+            if test_area < min_area_fraction * original_area:
+                continue
+
+            keep_mask[vi] = False
+            removed_this_cell += 1
+
+        if removed_this_cell > 0:
+            kept_pts = unique[keep_mask]
+            result.append(_close_polyline(kept_pts, tolerance))
+            total_removed += removed_this_cell
+            messages.append(
+                f"Cell {ci}: removed {removed_this_cell} tail vertex(es) "
+                f"(area: {original_area:.2f} -> {_polygon_area_2d(pts_2d[keep_mask]):.2f})"
+            )
+        else:
+            result.append(polyline.copy())
+
+    return result, total_removed, messages
+
+
+def _find_cross_polyline_intersections(
+    unique_point_lists: list[np.ndarray],
+    tolerance: float,
+) -> dict[int, list[tuple[int, np.ndarray]]]:
+    """Find all pairwise segment-segment crossings between different polylines.
+
+    Returns a mapping ``{polyline_index: [(segment_index, crossing_point), ...]}``.
+    Each crossing is recorded for BOTH involved polylines so both can insert
+    the crossing vertex during rebuild.
+    """
+    cross_tol = tolerance * 50
+    result: dict[int, list[tuple[int, np.ndarray]]] = {
+        i: [] for i in range(len(unique_point_lists))
+    }
+
+    for ia in range(len(unique_point_lists)):
+        pts_a = unique_point_lists[ia]
+        na = len(pts_a)
+        if na < 2:
+            continue
+        for ib in range(ia + 1, len(unique_point_lists)):
+            pts_b = unique_point_lists[ib]
+            nb = len(pts_b)
+            if nb < 2:
+                continue
+            for sa in range(na):
+                sa_next = (sa + 1) % na
+                for sb in range(nb):
+                    sb_next = (sb + 1) % nb
+                    pt = _segment_crossing_3d(
+                        pts_a[sa], pts_a[sa_next],
+                        pts_b[sb], pts_b[sb_next],
+                        cross_tol,
+                    )
+                    if pt is not None:
+                        result[ia].append((sa, pt))
+                        result[ib].append((sb, pt))
+
+    return result
+
+
+def _inject_crossing_points(
+    unique_points: np.ndarray,
+    crossings: list[tuple[int, np.ndarray]],
+    tolerance: float,
+) -> tuple[np.ndarray, set[int]]:
+    """Insert crossing points into a polyline's point array.
+
+    Returns ``(augmented_points, forced_discontinuity_indices)`` — the set
+    of indices in the new array that correspond to injected crossings and
+    must be treated as discontinuities regardless of angle/curvature.
+    """
+    if not crossings:
+        return unique_points, set()
+
+    n = len(unique_points)
+    insertions: list[tuple[int, np.ndarray]] = []
+    for seg_idx, pt in crossings:
+        seg_idx = min(seg_idx, n - 1)
+        near_existing = any(
+            float(np.linalg.norm(pt - unique_points[k])) < tolerance
+            for k in range(n)
+        )
+        if near_existing:
+            continue
+        already = any(
+            float(np.linalg.norm(pt - ip)) < tolerance for _, ip in insertions
+        )
+        if already:
+            continue
+        insertions.append((seg_idx, pt))
+
+    if not insertions:
+        return unique_points, set()
+
+    spliced = _splice_points_into_polyline(unique_points, insertions, tolerance)
+
+    forced: set[int] = set()
+    for _, ipt in insertions:
+        for k in range(len(spliced)):
+            if float(np.linalg.norm(spliced[k] - ipt)) < tolerance:
+                forced.add(k)
+                break
+
+    return spliced, forced
+
+
 def rebuild_polylines_from_discontinuities(
     polylines: list[np.ndarray],
     tolerance: float,
     discontinuity_angle_degrees: float = 176.0,
     neighbor_snap_tolerance: float | None = None,
 ) -> list[np.ndarray]:
+    unique_lists = [
+        _unique_polyline_points(p, tolerance=tolerance) for p in polylines
+    ]
+
+    crossings_map = _find_cross_polyline_intersections(unique_lists, tolerance)
+
     rebuilt_polylines: list[np.ndarray] = []
-    for polyline in polylines:
-        unique_points = _unique_polyline_points(polyline, tolerance=tolerance)
+    for pi, polyline in enumerate(polylines):
+        unique_points = unique_lists[pi]
         if len(unique_points) < 3:
             continue
+
+        augmented, forced_indices = _inject_crossing_points(
+            unique_points, crossings_map.get(pi, []), tolerance,
+        )
+
         straight_polyline, _ = _build_straight_polyline_from_discontinuities(
-            unique_points,
+            augmented,
             tolerance=tolerance,
             discontinuity_angle_degrees=discontinuity_angle_degrees,
+            forced_discontinuity_indices=forced_indices,
         )
         rebuilt_polyline = _sanitize_closed_polyline(straight_polyline, tolerance=tolerance)
         if len(_unique_polyline_points(rebuilt_polyline, tolerance=tolerance)) < 3:
@@ -1297,12 +1672,1213 @@ def rebuild_polylines_from_discontinuities(
     if not rebuilt_polylines:
         return []
 
-    snap_tolerance = neighbor_snap_tolerance if neighbor_snap_tolerance is not None else max(20.0 * tolerance, 0.02)
+    snap_tolerance = neighbor_snap_tolerance if neighbor_snap_tolerance is not None else default_snap_tolerance(tolerance)
     return _snap_neighboring_polyline_points(
         rebuilt_polylines,
         tolerance=tolerance,
         snap_tolerance=snap_tolerance,
     )
+
+
+def find_polyline_neighbours(
+    polylines: list[np.ndarray],
+    tolerance: float,
+) -> dict[int, list[int]]:
+    """Return mapping of polyline index to sorted list of neighbor indices.
+
+    Two polylines are neighbors if they share at least one vertex
+    (within *tolerance*).  Uses a spatial grid for O(n) lookup.
+    """
+    point_to_polys: dict[tuple[int, ...], set[int]] = {}
+    for idx, poly in enumerate(polylines):
+        unique = _unique_polyline_points(poly, tolerance)
+        for pt in unique:
+            key = tuple(np.round(pt / tolerance).astype(int).tolist())
+            if key not in point_to_polys:
+                point_to_polys[key] = set()
+            point_to_polys[key].add(idx)
+
+    neighbours: dict[int, set[int]] = {i: set() for i in range(len(polylines))}
+    for poly_set in point_to_polys.values():
+        indices = list(poly_set)
+        for i in range(len(indices)):
+            for j in range(i + 1, len(indices)):
+                neighbours[indices[i]].add(indices[j])
+                neighbours[indices[j]].add(indices[i])
+
+    return {k: sorted(v) for k, v in neighbours.items()}
+
+
+def align_neighbouring_polylines(
+    polylines: list[np.ndarray],
+    tolerance: float,
+    snap_tolerance: float | None = None,
+    slice_plane_x: float | None = None,
+) -> list[np.ndarray]:
+    """Align shared-edge segments between neighboring polylines.
+
+    For each pair of neighbors the function:
+
+    1. Finds shared vertices (voronoi face boundary corners).
+    2. Detects edge–edge crossings that are **not** at shared vertices
+       (these indicate misalignment).
+    3. Extracts the sub-path between each pair of consecutive shared
+       vertices from both polylines.
+    4. If point counts match the corresponding positions are averaged;
+       otherwise the shorter sub-path is resampled via arc-length
+       interpolation to match, then averaged.
+
+    When *slice_plane_x* is given, vertices near the cutting plane are
+    dampened (moved only 20 % toward the midpoint) so boundary cells
+    keep their extension toward the plane edge.
+
+    Returns a new list of polylines with aligned shared edges.
+    """
+    if snap_tolerance is None:
+        snap_tolerance = default_snap_tolerance(tolerance)
+
+    if len(polylines) < 2:
+        return [p.copy() for p in polylines]
+
+    neighbours = find_polyline_neighbours(polylines, snap_tolerance)
+
+    seg_updates: dict[int, dict[tuple[int, int], np.ndarray]] = {
+        i: {} for i in range(len(polylines))
+    }
+
+    processed: set[tuple[int, int]] = set()
+    for idx_a, nbrs in sorted(neighbours.items()):
+        for idx_b in nbrs:
+            pair = (min(idx_a, idx_b), max(idx_a, idx_b))
+            if pair in processed:
+                continue
+            processed.add(pair)
+            _compute_edge_alignment(
+                polylines, idx_a, idx_b, tolerance, snap_tolerance, seg_updates,
+                slice_plane_x=slice_plane_x,
+            )
+
+    result: list[np.ndarray] = []
+    for idx in range(len(polylines)):
+        if not seg_updates[idx]:
+            result.append(polylines[idx].copy())
+        else:
+            unique = _unique_polyline_points(polylines[idx], tolerance)
+            new_unique = _rebuild_polyline_from_updates(unique, seg_updates[idx])
+            result.append(_close_polyline(new_unique, tolerance))
+
+    return result
+
+
+def _find_shared_vertex_pairs(
+    pts_a: np.ndarray,
+    pts_b: np.ndarray,
+    tolerance: float,
+) -> list[tuple[int, int]]:
+    """Return ``(index_in_a, index_in_b)`` pairs of shared vertices."""
+    pairs: list[tuple[int, int]] = []
+    used_b: set[int] = set()
+    for ia in range(len(pts_a)):
+        best_ib = -1
+        best_dist = float("inf")
+        for ib in range(len(pts_b)):
+            if ib in used_b:
+                continue
+            d = float(np.linalg.norm(pts_a[ia] - pts_b[ib]))
+            if d < best_dist and d <= tolerance:
+                best_dist = d
+                best_ib = ib
+        if best_ib >= 0:
+            pairs.append((ia, best_ib))
+            used_b.add(best_ib)
+    return pairs
+
+
+def _cyclic_interior_indices(start: int, end: int, n: int) -> list[int]:
+    """Indices strictly between *start* and *end* in a cyclic array of size *n*."""
+    if start == end:
+        return []
+    indices: list[int] = []
+    i = (start + 1) % n
+    safety = 0
+    while i != end:
+        indices.append(i)
+        i = (i + 1) % n
+        safety += 1
+        if safety > n:
+            break
+    return indices
+
+
+def _segment_crossing_3d(
+    p1: np.ndarray,
+    p2: np.ndarray,
+    p3: np.ndarray,
+    p4: np.ndarray,
+    tolerance: float,
+) -> np.ndarray | None:
+    """Approximate crossing point of two 3-D line segments, or ``None``."""
+    d1 = p2 - p1
+    d2 = p4 - p3
+    r = p1 - p3
+
+    a = float(np.dot(d1, d1))
+    b = float(np.dot(d1, d2))
+    c = float(np.dot(d2, d2))
+    d_val = float(np.dot(d1, r))
+    e = float(np.dot(d2, r))
+
+    denom = a * c - b * b
+    if abs(denom) < 1e-20:
+        return None
+
+    t = (b * e - c * d_val) / denom
+    s = (a * e - b * d_val) / denom
+
+    eps = 0.01
+    if t < eps or t > 1.0 - eps or s < eps or s > 1.0 - eps:
+        return None
+
+    pt1 = p1 + t * d1
+    pt2 = p3 + s * d2
+    if float(np.linalg.norm(pt1 - pt2)) > tolerance:
+        return None
+
+    return (pt1 + pt2) / 2.0
+
+
+def _find_edge_crossings(
+    pts_a: np.ndarray,
+    pts_b: np.ndarray,
+    tolerance: float,
+    shared_positions: list[np.ndarray],
+) -> list[np.ndarray]:
+    """Edge–edge intersections between two polylines, excluding shared vertices."""
+    crossings: list[np.ndarray] = []
+    na, nb = len(pts_a), len(pts_b)
+    cross_tol = tolerance * 50
+
+    for ia in range(na):
+        ia_next = (ia + 1) % na
+        for ib in range(nb):
+            ib_next = (ib + 1) % nb
+            pt = _segment_crossing_3d(
+                pts_a[ia], pts_a[ia_next],
+                pts_b[ib], pts_b[ib_next],
+                cross_tol,
+            )
+            if pt is None:
+                continue
+            near_shared = any(
+                float(np.linalg.norm(pt - sp)) < cross_tol for sp in shared_positions
+            )
+            if not near_shared:
+                crossings.append(pt)
+
+    return crossings
+
+
+def _pick_matching_direction(
+    sub_a: np.ndarray,
+    sub_b_fwd: np.ndarray,
+    sub_b_rev: np.ndarray,
+) -> tuple[np.ndarray | None, str]:
+    """Choose the B sub-path direction that best matches A's sub-path."""
+    if len(sub_a) == 0:
+        if len(sub_b_fwd) > 0:
+            return sub_b_fwd, "forward"
+        if len(sub_b_rev) > 0:
+            return sub_b_rev, "reverse"
+        return None, "forward"
+
+    mid_a = sub_a.mean(axis=0)
+    d_fwd = (
+        float(np.linalg.norm(sub_b_fwd.mean(axis=0) - mid_a))
+        if len(sub_b_fwd) > 0
+        else float("inf")
+    )
+    d_rev = (
+        float(np.linalg.norm(sub_b_rev.mean(axis=0) - mid_a))
+        if len(sub_b_rev) > 0
+        else float("inf")
+    )
+
+    if d_fwd <= d_rev and len(sub_b_fwd) > 0:
+        return sub_b_fwd, "forward"
+    if len(sub_b_rev) > 0:
+        return sub_b_rev, "reverse"
+    if len(sub_b_fwd) > 0:
+        return sub_b_fwd, "forward"
+    return None, "forward"
+
+
+def _resample_polyline_segment(
+    points: np.ndarray,
+    target_count: int,
+) -> np.ndarray:
+    """Resample a polyline segment to *target_count* points via arc-length interpolation."""
+    if len(points) == target_count:
+        return points.copy()
+    if target_count <= 0:
+        return np.empty((0, points.shape[1]), dtype=float)
+    if target_count == 1:
+        return points[len(points) // 2 : len(points) // 2 + 1].copy()
+
+    diffs = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumlen = np.concatenate([[0.0], np.cumsum(diffs)])
+    total_len = cumlen[-1]
+
+    if total_len < 1e-12:
+        return np.tile(points[0], (target_count, 1))
+
+    new_params = np.linspace(0.0, total_len, target_count)
+    result = np.zeros((target_count, points.shape[1]), dtype=float)
+    for dim in range(points.shape[1]):
+        result[:, dim] = np.interp(new_params, cumlen, points[:, dim])
+    return result
+
+
+def _compute_edge_alignment(
+    polylines: list[np.ndarray],
+    idx_a: int,
+    idx_b: int,
+    tolerance: float,
+    snap_tolerance: float,
+    seg_updates: dict[int, dict[tuple[int, int], np.ndarray]],
+    slice_plane_x: float | None = None,
+) -> None:
+    """Compute aligned interior points for every shared edge of one neighbor pair."""
+    unique_a = _unique_polyline_points(polylines[idx_a], tolerance)
+    unique_b = _unique_polyline_points(polylines[idx_b], tolerance)
+
+    if len(unique_a) < 3 or len(unique_b) < 3:
+        return
+
+    shared = _find_shared_vertex_pairs(unique_a, unique_b, snap_tolerance)
+    if len(shared) < 2:
+        return
+
+    shared_positions = [unique_a[ia] for ia, _ in shared]
+    crossings = _find_edge_crossings(unique_a, unique_b, tolerance, shared_positions)
+
+    shared.sort(key=lambda p: p[0])
+    na, nb = len(unique_a), len(unique_b)
+
+    for k in range(len(shared)):
+        ia1, ib1 = shared[k]
+        ia2, ib2 = shared[(k + 1) % len(shared)]
+
+        int_a_idx = _cyclic_interior_indices(ia1, ia2, na)
+        if len(int_a_idx) == 0:
+            continue
+
+        int_b_fwd_idx = _cyclic_interior_indices(ib1, ib2, nb)
+        int_b_rev_idx = _cyclic_interior_indices(ib2, ib1, nb)
+
+        sub_a = unique_a[int_a_idx]
+        sub_b_fwd = unique_b[int_b_fwd_idx] if len(int_b_fwd_idx) > 0 else np.empty((0, 3))
+        sub_b_rev = (
+            unique_b[int_b_rev_idx][::-1] if len(int_b_rev_idx) > 0 else np.empty((0, 3))
+        )
+
+        sub_b, b_dir = _pick_matching_direction(sub_a, sub_b_fwd, sub_b_rev)
+        if sub_b is None or len(sub_b) == 0:
+            continue
+
+        mid_dist = float(np.linalg.norm(sub_a.mean(axis=0) - sub_b.mean(axis=0)))
+        shared_span = float(np.linalg.norm(unique_a[ia1] - unique_a[ia2]))
+        proximity_limit = max(shared_span * 0.5, snap_tolerance * 5)
+        if mid_dist > proximity_limit:
+            continue
+
+        max_sub = max(len(sub_a), len(sub_b))
+        min_sub = max(min(len(sub_a), len(sub_b)), 1)
+        if max_sub > min_sub * 3:
+            continue
+
+        needs_align = len(crossings) > 0
+        if not needs_align and len(sub_a) == len(sub_b):
+            max_diff = float(np.max(np.linalg.norm(sub_a - sub_b, axis=1)))
+            needs_align = max_diff > tolerance
+        elif not needs_align:
+            needs_align = True
+
+        if not needs_align:
+            continue
+
+        target = max(len(sub_a), len(sub_b))
+        ra = _resample_polyline_segment(sub_a, target) if len(sub_a) != target else sub_a
+        rb = _resample_polyline_segment(sub_b, target) if len(sub_b) != target else sub_b
+        aligned = (ra + rb) / 2.0
+
+        if slice_plane_x is not None:
+            plane_tol = tolerance * 50
+            boundary_damping = 0.2
+            for vi in range(len(aligned)):
+                if (abs(float(ra[vi, 0]) - slice_plane_x) < plane_tol
+                        or abs(float(rb[vi, 0]) - slice_plane_x) < plane_tol):
+                    aligned[vi] = ra[vi] + boundary_damping * (aligned[vi] - ra[vi])
+
+        max_shift_a = float(np.max(np.linalg.norm(ra - aligned, axis=1)))
+        max_shift_b = float(np.max(np.linalg.norm(rb - aligned, axis=1)))
+        shift_limit = max(shared_span * 0.5, snap_tolerance * 10)
+        if max(max_shift_a, max_shift_b) > shift_limit:
+            continue
+
+        seg_updates[idx_a][(ia1, ia2)] = aligned
+
+        if b_dir == "forward":
+            seg_updates[idx_b][(ib1, ib2)] = aligned.copy()
+        else:
+            seg_updates[idx_b][(ib2, ib1)] = aligned[::-1].copy()
+
+
+def _rebuild_polyline_from_updates(
+    unique_pts: np.ndarray,
+    updates: dict[tuple[int, int], np.ndarray],
+) -> np.ndarray:
+    """Rebuild unique-point array by splicing in updated interior segments."""
+    n = len(unique_pts)
+    if not updates:
+        return unique_pts.copy()
+
+    boundary_set: set[int] = set()
+    for s, e in updates:
+        boundary_set.add(s)
+        boundary_set.add(e)
+
+    sorted_boundaries = sorted(boundary_set)
+    if len(sorted_boundaries) < 2:
+        return unique_pts.copy()
+
+    parts: list[np.ndarray] = []
+    for k in range(len(sorted_boundaries)):
+        start = sorted_boundaries[k]
+        end = sorted_boundaries[(k + 1) % len(sorted_boundaries)]
+
+        parts.append(unique_pts[start : start + 1])
+
+        if (start, end) in updates:
+            parts.append(updates[(start, end)])
+        else:
+            interior = _cyclic_interior_indices(start, end, n)
+            if len(interior) > 0:
+                parts.append(unique_pts[interior])
+
+    if not parts:
+        return unique_pts.copy()
+    return np.vstack(parts)
+
+
+def point_distance_to_mesh_surface(
+    point: np.ndarray,
+    surface: pv.PolyData,
+) -> tuple[float, np.ndarray]:
+    """Distance from a 3D point to the nearest location on a mesh surface.
+
+    Uses a VTK cell-locator so the returned closest point can lie in the
+    interior of a triangle face, not only at mesh vertices.
+
+    Returns ``(distance, closest_point_on_surface)``.
+    """
+    if surface.n_cells == 0 or surface.n_points == 0:
+        return float("inf"), np.asarray(point, dtype=float).copy()
+
+    tri = surface.triangulate().clean()
+    if tri.n_cells == 0:
+        return float("inf"), np.asarray(point, dtype=float).copy()
+
+    locator = vtk.vtkCellLocator()
+    locator.SetDataSet(tri)
+    locator.BuildLocator()
+
+    pt = [float(point[0]), float(point[1]), float(point[2])]
+    cp = [0.0, 0.0, 0.0]
+    gc = vtk.vtkGenericCell()
+    cid = vtk.reference(0)
+    sid = vtk.reference(0)
+    d2 = vtk.reference(0.0)
+    locator.FindClosestPoint(pt, cp, gc, cid, sid, d2)
+    return float(d2) ** 0.5, np.array(cp, dtype=float)
+
+
+def validate_polyline_surfaces(
+    polylines: list[np.ndarray],
+    tolerance: float,
+    snap_tolerance: float | None = None,
+) -> list[tuple[int, int, bool, int]]:
+    """Check every neighbour pair for fan-surface overlaps.
+
+    For each pair the function builds a fan surface (centroid to polygon
+    edges), intersects the two surfaces, and checks whether every
+    intersection point lies on *both* polyline boundaries (shared edge)
+    or only on one (overlap).
+
+    Returns ``(idx_a, idx_b, has_overlap, non_shared_intersection_point_count)``
+    for every neighbour pair that was checked.
+    """
+    if snap_tolerance is None:
+        snap_tolerance = default_snap_tolerance(tolerance)
+
+    neighbours = find_polyline_neighbours(polylines, snap_tolerance)
+    results: list[tuple[int, int, bool, int]] = []
+    processed: set[tuple[int, int]] = set()
+
+    vtk.vtkObject.GlobalWarningDisplayOff()
+
+    for idx_a, nbrs in sorted(neighbours.items()):
+        for idx_b in nbrs:
+            pair = (min(idx_a, idx_b), max(idx_a, idx_b))
+            if pair in processed:
+                continue
+            processed.add(pair)
+
+            unique_a = _unique_polyline_points(polylines[idx_a], tolerance)
+            unique_b = _unique_polyline_points(polylines[idx_b], tolerance)
+            if len(unique_a) < 3 or len(unique_b) < 3:
+                continue
+
+            fan_a = _fan_surface_from_center(unique_a.mean(axis=0), unique_a)
+            fan_b = _fan_surface_from_center(unique_b.mean(axis=0), unique_b)
+            if fan_a.n_cells == 0 or fan_b.n_cells == 0:
+                continue
+
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*not valid.*vtkOriginalCellIds.*")
+                    intersection, _, _ = fan_a.triangulate().clean().intersection(
+                        fan_b.triangulate().clean(),
+                        split_first=False,
+                        split_second=False,
+                    )
+                    intersection = _strip_stale_cell_arrays(intersection)
+            except Exception:
+                continue
+
+            if intersection.n_points == 0:
+                results.append((pair[0], pair[1], False, 0))
+                continue
+
+            check_tol = snap_tolerance * 3
+            int_pts = np.asarray(intersection.points, dtype=float)
+            non_shared = 0
+            for ipt in int_pts:
+                da = _distance_point_to_polyline(ipt, polylines[pair[0]])
+                db = _distance_point_to_polyline(ipt, polylines[pair[1]])
+                if not (da < check_tol and db < check_tol):
+                    non_shared += 1
+
+            results.append((pair[0], pair[1], non_shared > 0, non_shared))
+
+    return results
+
+
+def fix_polyline_surface_overlaps(
+    polylines: list[np.ndarray],
+    tolerance: float,
+    snap_tolerance: float | None = None,
+    max_iterations: int = 5,
+) -> tuple[list[np.ndarray], int, list[str]]:
+    """Fix overlapping neighbour surfaces by relocating offending vertices.
+
+    For each neighbour pair, every non-shared vertex of polyline A is
+    checked against polyline B's polygon (projected onto B's best-fit
+    plane).  If the vertex lies inside B's polygon it is relocated to the
+    nearest shared-edge segment (straight line between consecutive shared
+    vertices).  The same check runs symmetrically for B against A.
+
+    Returns ``(fixed_polylines, total_relocated, log_messages)``.
+    """
+    if snap_tolerance is None:
+        snap_tolerance = default_snap_tolerance(tolerance)
+
+    result = [p.copy() for p in polylines]
+    total_relocated = 0
+    messages: list[str] = []
+
+    for iteration in range(max_iterations):
+        neighbours = find_polyline_neighbours(result, snap_tolerance)
+        relocated_this_round = 0
+        processed: set[tuple[int, int]] = set()
+
+        for idx_a, nbrs in sorted(neighbours.items()):
+            for idx_b in nbrs:
+                pair = (min(idx_a, idx_b), max(idx_a, idx_b))
+                if pair in processed:
+                    continue
+                processed.add(pair)
+                relocated_this_round += _fix_pair_overlap(
+                    result, pair[0], pair[1], tolerance, snap_tolerance,
+                )
+
+        total_relocated += relocated_this_round
+        if relocated_this_round > 0:
+            messages.append(
+                f"Overlap fix pass {iteration + 1}: relocated {relocated_this_round} point(s)"
+            )
+        if relocated_this_round == 0:
+            break
+
+    result = _resnap_shared_vertices(result, tolerance, snap_tolerance)
+
+    result, pocket_removed, pocket_msgs = resolve_pocket_cells(result, tolerance, snap_tolerance)
+    messages.extend(pocket_msgs)
+
+    restored = 0
+    for i in range(len(result)):
+        unique_fixed = _unique_polyline_points(result[i], tolerance)
+        if len(unique_fixed) < 3:
+            result[i] = polylines[i].copy()
+            restored += 1
+    if restored > 0:
+        messages.append(f"Restored {restored} degenerate polyline(s) to pre-fix state")
+
+    return result, total_relocated, messages
+
+
+def _resnap_shared_vertices(
+    polylines: list[np.ndarray],
+    tolerance: float,
+    snap_tolerance: float,
+) -> list[np.ndarray]:
+    """Re-snap shared vertices between neighbours to close gaps."""
+    unique_lists = [_unique_polyline_points(p, tolerance).copy() for p in polylines]
+    closed_for_query = [_close_polyline(u, tolerance) for u in unique_lists]
+    neighbours = find_polyline_neighbours(closed_for_query, snap_tolerance)
+
+    processed: set[tuple[int, int]] = set()
+    for idx_a, nbrs in sorted(neighbours.items()):
+        for idx_b in nbrs:
+            pair = (min(idx_a, idx_b), max(idx_a, idx_b))
+            if pair in processed:
+                continue
+            processed.add(pair)
+
+            shared = _find_shared_vertex_pairs(
+                unique_lists[pair[0]], unique_lists[pair[1]], snap_tolerance,
+            )
+            for ia, ib in shared:
+                avg = (unique_lists[pair[0]][ia] + unique_lists[pair[1]][ib]) / 2.0
+                unique_lists[pair[0]][ia] = avg
+                unique_lists[pair[1]][ib] = avg
+
+    return [_close_polyline(u, tolerance) for u in unique_lists]
+
+
+def resolve_pocket_cells(
+    polylines: list[np.ndarray],
+    tolerance: float,
+    snap_tolerance: float | None = None,
+) -> tuple[list[np.ndarray], list[int], list[str]]:
+    """Remove pocket cells that are fully enclosed by a single larger neighbour.
+
+    A cell is a pocket of neighbour N only when **every** polyline segment
+    that is not shared with N is geometrically inside N's polygon.  If even
+    one non-shared segment reaches outside N (e.g. toward a different
+    neighbour), the cell is considered independent and kept.
+
+    The check works on segment midpoints projected onto N's best-fit plane.
+
+    Returns ``(filtered_polylines, removed_indices, log_messages)``.
+    """
+    if snap_tolerance is None:
+        snap_tolerance = default_snap_tolerance(tolerance)
+
+    neighbours = find_polyline_neighbours(polylines, snap_tolerance)
+    pocket_indices: set[int] = set()
+    messages: list[str] = []
+
+    for idx in range(len(polylines)):
+        u = _unique_polyline_points(polylines[idx], tolerance)
+        if len(u) < 3:
+            continue
+        n_u = len(u)
+
+        for nbr_idx in neighbours.get(idx, []):
+            u_nbr = _unique_polyline_points(polylines[nbr_idx], tolerance)
+            if len(u_nbr) < 3:
+                continue
+            if len(u_nbr) <= len(u):
+                continue
+
+            shared = _find_shared_vertex_pairs(u, u_nbr, snap_tolerance)
+            if len(shared) < 2:
+                continue
+
+            shared_set = {ia for ia, _ in shared}
+
+            po_n, pu_n, pv_n, pn_n = _fit_plane(u_nbr)
+            p2d_n = _project_to_plane(u_nbr, po_n, pu_n, pv_n)
+            max_oop = float(np.max(np.abs(np.dot(u_nbr - po_n, pn_n))))
+            oop_limit = max_oop + snap_tolerance * 5
+
+            non_shared_segs = 0
+            inside_segs = 0
+            for si in range(n_u):
+                vi_a = si
+                vi_b = (si + 1) % n_u
+                if vi_a in shared_set and vi_b in shared_set:
+                    continue
+                non_shared_segs += 1
+                midpoint = (u[vi_a] + u[vi_b]) * 0.5
+                if abs(float(np.dot(midpoint - po_n, pn_n))) > oop_limit:
+                    continue
+                mid_2d = _project_to_plane(midpoint[None, :], po_n, pu_n, pv_n)[0]
+                if _point_in_polygon_2d(mid_2d, p2d_n):
+                    inside_segs += 1
+
+            if non_shared_segs == 0:
+                pocket_indices.add(idx)
+                messages.append(
+                    f"Pocket cell {idx} removed (all {n_u} segments shared "
+                    f"with larger cell {nbr_idx})"
+                )
+                break
+
+            if inside_segs == non_shared_segs:
+                pocket_indices.add(idx)
+                messages.append(
+                    f"Pocket cell {idx} removed ({inside_segs}/{non_shared_segs} "
+                    f"non-shared segments inside larger cell {nbr_idx}, "
+                    f"{len(shared)}/{n_u} shared vertices)"
+                )
+                break
+
+    removed = sorted(pocket_indices)
+    kept = [p for i, p in enumerate(polylines) if i not in pocket_indices]
+    return kept, removed, messages
+
+
+def _find_nearest_segment_on_cells(
+    point: np.ndarray,
+    candidate_indices: list[int],
+    polylines: list[np.ndarray],
+    tolerance: float,
+) -> tuple[float, np.ndarray, int, int]:
+    """Find the nearest polyline segment across a set of candidate cells.
+
+    Returns ``(distance, projected_point, cell_index, segment_index)``.
+    """
+    best_dist = float("inf")
+    best_pt = point.copy()
+    best_cell = -1
+    best_seg = -1
+
+    for ni in candidate_indices:
+        if ni < 0 or ni >= len(polylines):
+            continue
+        un = _unique_polyline_points(polylines[ni], tolerance)
+        if len(un) < 3:
+            continue
+        closed_n = _close_polyline(un, tolerance)
+        for si in range(len(closed_n) - 1):
+            ab = closed_n[si + 1] - closed_n[si]
+            ab_sq = float(np.dot(ab, ab))
+            if ab_sq < 1e-20:
+                proj = closed_n[si].copy()
+            else:
+                t = max(0.0, min(1.0, float(np.dot(point - closed_n[si], ab)) / ab_sq))
+                proj = closed_n[si] + t * ab
+            d = float(np.linalg.norm(point - proj))
+            if d < best_dist:
+                best_dist = d
+                best_pt = proj
+                best_cell = ni
+                best_seg = si
+
+    return best_dist, best_pt, best_cell, best_seg
+
+
+def close_free_vertices(
+    polylines: list[np.ndarray],
+    surface: pv.PolyData,
+    tolerance: float,
+    snap_tolerance: float | None = None,
+) -> tuple[list[np.ndarray], int, list[str]]:
+    """Snap free vertices of interior cells to neighbour edges and insert
+    the snapped point into the neighbour's polyline so both cells share it.
+
+    A *free vertex* is one not shared with any neighbour.  For cells
+    whose polyline lies entirely inside the lofted surface (not an edge
+    cell), every vertex should be shared with at least one neighbour.
+    Free vertices create gaps between cells.
+
+    For each free vertex the function:
+    1. Projects it onto the nearest segment of the nearest neighbour.
+    2. Moves the free vertex to that projected position.
+    3. **Inserts** that position into the neighbour's polyline between
+       the two segment endpoints, creating a new shared vertex.
+
+    Returns ``(updated_polylines, total_snapped, log_messages)``.
+    """
+    if snap_tolerance is None:
+        snap_tolerance = default_snap_tolerance(tolerance)
+
+    result = [p.copy() for p in polylines]
+    neighbours = find_polyline_neighbours(result, snap_tolerance)
+    boundary_pts = _surface_boundary_points(surface, snap_tolerance)
+    messages: list[str] = []
+    total_snapped = 0
+
+    insertions: dict[int, list[tuple[int, np.ndarray]]] = {}
+
+    for ci in range(len(result)):
+        u = _unique_polyline_points(result[ci], tolerance)
+        if len(u) < 3:
+            continue
+
+        shared_indices: set[int] = set()
+        for ni in neighbours.get(ci, []):
+            un = _unique_polyline_points(result[ni], tolerance)
+            for ia, _ in _find_shared_vertex_pairs(u, un, snap_tolerance):
+                shared_indices.add(ia)
+
+        free_indices = [i for i in range(len(u)) if i not in shared_indices]
+        if not free_indices:
+            continue
+
+        u_copy = u.copy()
+        snapped_this_cell = 0
+        nbr_snap_limit = snap_tolerance * 20
+
+        dists_from_center = np.linalg.norm(u - u.mean(axis=0), axis=1)
+        cell_radius = float(dists_from_center.max()) if len(dists_from_center) > 0 else 1.0
+        extended_snap_limit = min(
+            max(snap_tolerance * 100, 2.0),
+            cell_radius * 0.5,
+        )
+
+        for fi in free_indices:
+            if _is_on_surface_boundary(u_copy[fi], boundary_pts, snap_tolerance * 5):
+                continue
+
+            best_dist, best_pt, best_nbr, best_seg_idx = _find_nearest_segment_on_cells(
+                u_copy[fi], neighbours.get(ci, []), result, tolerance,
+            )
+
+            if best_dist > nbr_snap_limit:
+                non_nbr_candidates = [
+                    oi for oi in range(len(result))
+                    if oi != ci and oi not in neighbours.get(ci, [])
+                ]
+                ext_dist, ext_pt, ext_nbr, ext_seg = _find_nearest_segment_on_cells(
+                    u_copy[fi], non_nbr_candidates, result, tolerance,
+                )
+                if ext_dist < best_dist:
+                    best_dist, best_pt, best_nbr, best_seg_idx = ext_dist, ext_pt, ext_nbr, ext_seg
+
+            snap_limit = extended_snap_limit if best_dist > nbr_snap_limit else nbr_snap_limit
+            if best_dist < snap_limit and best_nbr >= 0:
+                u_copy[fi] = best_pt
+                snapped_this_cell += 1
+                if best_nbr not in insertions:
+                    insertions[best_nbr] = []
+                insertions[best_nbr].append((best_seg_idx, best_pt.copy()))
+
+        if snapped_this_cell > 0:
+            result[ci] = _close_polyline(u_copy, tolerance)
+            total_snapped += snapped_this_cell
+
+    for ni, ins_list in insertions.items():
+        u_nbr = _unique_polyline_points(result[ni], tolerance).copy()
+        spliced = _splice_points_into_polyline(
+            u_nbr, ins_list, tolerance, dedup_against_existing=True,
+        )
+        result[ni] = _close_polyline(spliced, tolerance)
+
+    if total_snapped > 0:
+        messages.append(f"Snapped {total_snapped} free vertices to neighbour edges")
+
+    total_absorbed = 0
+    for _absorb_pass in range(5):
+        result, absorbed = _absorb_nearby_neighbour_vertices(result, tolerance, snap_tolerance)
+        total_absorbed += absorbed
+        if absorbed == 0:
+            break
+    if total_absorbed > 0:
+        messages.append(f"Absorbed {total_absorbed} neighbour vertices into cell polylines")
+
+    for i in range(len(result)):
+        result[i] = _deduplicate_polyline(result[i], tolerance)
+
+    result, junctions_added = _insert_junction_points(result, tolerance, snap_tolerance)
+    if junctions_added > 0:
+        messages.append(f"Inserted {junctions_added} junction points from neighbour intersections")
+        for i in range(len(result)):
+            result[i] = _deduplicate_polyline(result[i], tolerance)
+
+    return result, total_snapped + total_absorbed + junctions_added, messages
+
+
+def _insert_junction_points(
+    polylines: list[np.ndarray],
+    tolerance: float,
+    snap_tolerance: float,
+) -> tuple[list[np.ndarray], int]:
+    """Insert junction points that neighbours share but a cell lacks.
+
+    A *junction point* is a vertex shared by two or more of cell C's
+    neighbours.  If that point is close to C's polyline but C doesn't
+    have it, there's a tiling gap at the junction.  This function finds
+    such points and inserts them into C's polyline.
+
+    Returns ``(updated_polylines, total_inserted)``.
+    """
+    result = [p.copy() for p in polylines]
+    neighbours = find_polyline_neighbours(result, snap_tolerance)
+    junction_limit = max(snap_tolerance * 30, 0.6)
+    total_inserted = 0
+
+    for ci in range(len(result)):
+        u_c = _unique_polyline_points(result[ci], tolerance)
+        if len(u_c) < 3:
+            continue
+        closed_c = _close_polyline(u_c, tolerance)
+        cell_nbrs = neighbours.get(ci, [])
+        if len(cell_nbrs) < 2:
+            continue
+
+        nbr_verts: dict[tuple[int, ...], list[tuple[int, int, np.ndarray]]] = {}
+        for ni in cell_nbrs:
+            u_n = _unique_polyline_points(result[ni], tolerance)
+            for vi in range(len(u_n)):
+                key = tuple(np.round(u_n[vi] / snap_tolerance).astype(int).tolist())
+                if key not in nbr_verts:
+                    nbr_verts[key] = []
+                nbr_verts[key].append((ni, vi, u_n[vi]))
+
+        to_insert: list[tuple[int, np.ndarray]] = []
+        for key, entries in nbr_verts.items():
+            if len(entries) < 2:
+                continue
+            unique_cells = len(set(ni for ni, _, _ in entries))
+            if unique_cells < 2:
+                continue
+
+            pt = entries[0][2]
+            near_existing = any(
+                float(np.linalg.norm(pt - u_c[k])) < snap_tolerance
+                for k in range(len(u_c))
+            )
+            if near_existing:
+                continue
+
+            d_seg = _distance_point_to_polyline(pt, closed_c)
+            if d_seg > junction_limit:
+                continue
+
+            best_seg = -1
+            best_sd = float("inf")
+            for si in range(len(closed_c) - 1):
+                sd = _distance_point_to_segment(pt, closed_c[si], closed_c[si + 1])
+                if sd < best_sd:
+                    best_sd = sd
+                    best_seg = si
+
+            already = any(
+                float(np.linalg.norm(pt - ip)) < tolerance for _, ip in to_insert
+            )
+            if not already and best_seg >= 0:
+                to_insert.append((best_seg, pt.copy()))
+
+        if not to_insert:
+            continue
+
+        spliced = _splice_points_into_polyline(u_c, to_insert, tolerance)
+        result[ci] = _close_polyline(spliced, tolerance)
+        total_inserted += len(to_insert)
+
+    return result, total_inserted
+
+
+def _deduplicate_polyline(polyline: np.ndarray, tolerance: float) -> np.ndarray:
+    """Remove consecutive duplicate vertices from a closed polyline."""
+    u = _unique_polyline_points(polyline, tolerance)
+    if len(u) < 3:
+        return polyline
+    kept = [u[0]]
+    for i in range(1, len(u)):
+        if float(np.linalg.norm(u[i] - kept[-1])) > tolerance:
+            is_dup = any(float(np.linalg.norm(u[i] - k)) < tolerance for k in kept)
+            if not is_dup:
+                kept.append(u[i])
+    if len(kept) < 3:
+        return polyline
+    return _close_polyline(np.array(kept, dtype=float), tolerance)
+
+
+def _absorb_nearby_neighbour_vertices(
+    polylines: list[np.ndarray],
+    tolerance: float,
+    snap_tolerance: float,
+) -> tuple[list[np.ndarray], int]:
+    """Insert neighbour vertices that lie on our polyline but aren't shared.
+
+    For each cell C and each neighbour N, any vertex of N that is close
+    to a segment of C but not already matched to a vertex of C is inserted
+    into C's polyline.  This closes triangle-shaped holes caused by one
+    cell having a vertex at a junction that the adjacent cell lacks.
+
+    Returns ``(updated_polylines, total_absorbed)``.
+    """
+    result = [p.copy() for p in polylines]
+    neighbours = find_polyline_neighbours(result, snap_tolerance)
+    absorb_limit = snap_tolerance * 10
+    total_absorbed = 0
+
+    for ci in range(len(result)):
+        u_c = _unique_polyline_points(result[ci], tolerance)
+        if len(u_c) < 3:
+            continue
+        closed_c = _close_polyline(u_c, tolerance)
+
+        to_insert: list[tuple[int, np.ndarray]] = []
+
+        for ni in neighbours.get(ci, []):
+            u_n = _unique_polyline_points(result[ni], tolerance)
+            if len(u_n) < 3:
+                continue
+
+            shared_c = {ia for ia, _ in _find_shared_vertex_pairs(u_c, u_n, snap_tolerance)}
+
+            for vi in range(len(u_n)):
+                pt = u_n[vi]
+                near_existing = any(
+                    float(np.linalg.norm(pt - u_c[k])) < snap_tolerance
+                    for k in range(len(u_c))
+                )
+                if near_existing:
+                    continue
+
+                best_seg = -1
+                best_d = float("inf")
+                for si in range(len(closed_c) - 1):
+                    d = _distance_point_to_segment(pt, closed_c[si], closed_c[si + 1])
+                    if d < best_d:
+                        best_d = d
+                        best_seg = si
+
+                if best_d < absorb_limit and best_seg >= 0:
+                    already = any(
+                        float(np.linalg.norm(pt - ip)) < tolerance
+                        for _, ip in to_insert
+                    )
+                    if not already:
+                        to_insert.append((best_seg, pt.copy()))
+
+        if not to_insert:
+            continue
+
+        spliced = _splice_points_into_polyline(u_c, to_insert, tolerance)
+        result[ci] = _close_polyline(spliced, tolerance)
+        total_absorbed += len(to_insert)
+
+    return result, total_absorbed
+
+
+def _surface_boundary_points(
+    surface: pv.PolyData,
+    snap_tolerance: float,
+) -> np.ndarray:
+    """Extract boundary vertex positions from the lofted surface."""
+    boundary = surface.extract_feature_edges(
+        boundary_edges=True,
+        feature_edges=False,
+        manifold_edges=False,
+        non_manifold_edges=False,
+    ).clean()
+    if boundary.n_points == 0:
+        return np.empty((0, 3), dtype=float)
+    return np.asarray(boundary.points, dtype=float)
+
+
+def _is_on_surface_boundary(
+    point: np.ndarray,
+    boundary_pts: np.ndarray,
+    edge_tol: float,
+) -> bool:
+    """Check if a single point is near the surface boundary."""
+    if len(boundary_pts) == 0:
+        return False
+    dists = np.linalg.norm(boundary_pts - point, axis=1)
+    return float(dists.min()) < edge_tol
+
+
+def _detect_edge_cells(
+    polylines: list[np.ndarray],
+    surface: pv.PolyData,
+    tolerance: float,
+    snap_tolerance: float,
+) -> set[int]:
+    """Return indices of cells that touch the lofted surface boundary."""
+    bnd_pts = _surface_boundary_points(surface, snap_tolerance)
+    if len(bnd_pts) == 0:
+        return set()
+
+    edge_tol = snap_tolerance * 5
+    edge_cells: set[int] = set()
+
+    for ci in range(len(polylines)):
+        u = _unique_polyline_points(polylines[ci], tolerance)
+        for pt in u:
+            dists = np.linalg.norm(bnd_pts - pt, axis=1)
+            if float(dists.min()) < edge_tol:
+                edge_cells.add(ci)
+                break
+
+    return edge_cells
+
+
+def _distance_point_to_polyline(
+    point: np.ndarray,
+    polyline: np.ndarray,
+) -> float:
+    """Minimum distance from *point* to any segment of *polyline*."""
+    if len(polyline) < 2:
+        if len(polyline) == 1:
+            return float(np.linalg.norm(point - polyline[0]))
+        return float("inf")
+    best = float("inf")
+    for i in range(len(polyline) - 1):
+        d = _distance_point_to_segment(point, polyline[i], polyline[i + 1])
+        if d < best:
+            best = d
+    return best
+
+
+def _distance_point_to_segment(
+    point: np.ndarray,
+    seg_a: np.ndarray,
+    seg_b: np.ndarray,
+) -> float:
+    """Distance from *point* to the finite line segment *seg_a*--*seg_b*."""
+    ab = seg_b - seg_a
+    ab_sq = float(np.dot(ab, ab))
+    if ab_sq < 1e-20:
+        return float(np.linalg.norm(point - seg_a))
+    t = max(0.0, min(1.0, float(np.dot(point - seg_a, ab)) / ab_sq))
+    proj = seg_a + t * ab
+    return float(np.linalg.norm(point - proj))
+
+
+def _project_point_to_nearest_segment(
+    point: np.ndarray,
+    segments: list[tuple[np.ndarray, np.ndarray]],
+) -> np.ndarray:
+    """Project *point* onto the nearest segment, return the projected point."""
+    best_dist = float("inf")
+    best_proj = point.copy()
+    for seg_a, seg_b in segments:
+        ab = seg_b - seg_a
+        ab_sq = float(np.dot(ab, ab))
+        if ab_sq < 1e-20:
+            proj = seg_a.copy()
+        else:
+            t = max(0.0, min(1.0, float(np.dot(point - seg_a, ab)) / ab_sq))
+            proj = seg_a + t * ab
+        d = float(np.linalg.norm(point - proj))
+        if d < best_dist:
+            best_dist = d
+            best_proj = proj
+    return best_proj
+
+
+def _fix_pair_overlap(
+    polylines: list[np.ndarray],
+    idx_a: int,
+    idx_b: int,
+    tolerance: float,
+    snap_tolerance: float,
+) -> int:
+    """Fix surface overlap for one neighbour pair.  Returns relocated count.
+
+    Detects when one cell *dominates* the other (a legitimate smaller cell
+    whose non-shared vertices are mostly inside the larger cell) and
+    preserves the smaller cell instead of collapsing it onto the shared edge.
+    """
+    unique_a = _unique_polyline_points(polylines[idx_a], tolerance).copy()
+    unique_b = _unique_polyline_points(polylines[idx_b], tolerance).copy()
+
+    if len(unique_a) < 3 or len(unique_b) < 3:
+        return 0
+
+    shared = _find_shared_vertex_pairs(unique_a, unique_b, snap_tolerance)
+    if len(shared) < 2:
+        return 0
+
+    shared_a_set = {ia for ia, _ in shared}
+    shared_b_set = {ib for _, ib in shared}
+
+    shared_sorted_a = sorted(shared, key=lambda p: p[0])
+    segs_a: list[tuple[np.ndarray, np.ndarray]] = [
+        (unique_a[shared_sorted_a[k][0]].copy(),
+         unique_a[shared_sorted_a[(k + 1) % len(shared_sorted_a)][0]].copy())
+        for k in range(len(shared_sorted_a))
+    ]
+
+    shared_sorted_b = sorted(shared, key=lambda p: p[1])
+    segs_b: list[tuple[np.ndarray, np.ndarray]] = [
+        (unique_b[shared_sorted_b[k][1]].copy(),
+         unique_b[shared_sorted_b[(k + 1) % len(shared_sorted_b)][1]].copy())
+        for k in range(len(shared_sorted_b))
+    ]
+
+    edge_proximity = tolerance * 10
+    a_non_shared = [i for i in range(len(unique_a)) if i not in shared_a_set]
+    b_non_shared = [i for i in range(len(unique_b)) if i not in shared_b_set]
+
+    po_a, pu_a, pv_a, pn_a = _fit_plane(unique_a)
+    po_b, pu_b, pv_b, pn_b = _fit_plane(unique_b)
+    poly2d_a = _project_to_plane(unique_a, po_a, pu_a, pv_a)
+    poly2d_b = _project_to_plane(unique_b, po_b, pu_b, pv_b)
+    max_oop_a = float(np.max(np.abs(np.dot(unique_a - po_a, pn_a))))
+    max_oop_b = float(np.max(np.abs(np.dot(unique_b - po_b, pn_b))))
+
+    def _inside(pt: np.ndarray, po: np.ndarray, pu: np.ndarray, pv: np.ndarray,
+                pn: np.ndarray, poly2d: np.ndarray, max_oop: float) -> bool:
+        if abs(float(np.dot(pt - po, pn))) > max_oop + snap_tolerance * 5:
+            return False
+        return _point_in_polygon_2d(
+            _project_to_plane(pt[None, :], po, pu, pv)[0], poly2d,
+        )
+
+    a_inside_b = [
+        i for i in a_non_shared
+        if _inside(unique_a[i], po_b, pu_b, pv_b, pn_b, poly2d_b, max_oop_b)
+    ]
+    b_inside_a = [
+        i for i in b_non_shared
+        if _inside(unique_b[i], po_a, pu_a, pv_a, pn_a, poly2d_a, max_oop_a)
+    ]
+
+    a_dominated = len(a_non_shared) > 0 and len(a_inside_b) > len(a_non_shared) * 0.85
+    b_dominated = len(b_non_shared) > 0 and len(b_inside_a) > len(b_non_shared) * 0.85
+
+    relocated = 0
+
+    if not a_dominated:
+        for i in a_inside_b:
+            if segs_a and min(
+                _distance_point_to_segment(unique_a[i], s1, s2) for s1, s2 in segs_a
+            ) < edge_proximity:
+                continue
+            unique_a[i] = _project_point_to_nearest_segment(unique_a[i], segs_a)
+            relocated += 1
+
+    if not b_dominated:
+        for i in b_inside_a:
+            if segs_b and min(
+                _distance_point_to_segment(unique_b[i], s1, s2) for s1, s2 in segs_b
+            ) < edge_proximity:
+                continue
+            unique_b[i] = _project_point_to_nearest_segment(unique_b[i], segs_b)
+            relocated += 1
+
+    if relocated > 0:
+        polylines[idx_a] = _close_polyline(unique_a, tolerance)
+        polylines[idx_b] = _close_polyline(unique_b, tolerance)
+
+    return relocated
 
 
 def analyze_and_generate_surfaces(
@@ -1349,9 +2925,11 @@ def analyze_and_generate_surfaces(
             plane_normal,
             tolerance=tolerance,
         )
-        u_span, v_span, _ = bbox_extents
+        u_span, v_span, n_span = bbox_extents
         min_span = min(u_span, v_span)
         bbox_aspect_ratio = max(u_span, v_span) / min_span if min_span > tolerance else 1.0
+        max_planar_span = max(u_span, v_span)
+        planarity_ratio = n_span / max_planar_span if max_planar_span > tolerance else 0.0
         curve_length = _polyline_length(followup_polyline)
         if curve_length <= tolerance:
             continue
@@ -1383,6 +2961,7 @@ def analyze_and_generate_surfaces(
                 curve_length=curve_length,
                 ratio=bbox_volume / curve_length,
                 bbox_aspect_ratio=bbox_aspect_ratio,
+                planarity_ratio=planarity_ratio,
                 scaled_circle_center=scaled_circle_center,
                 extrusion_base_vector=direction_vector,
                 offset_direction=offset_direction,
@@ -1405,7 +2984,10 @@ def analyze_and_generate_surfaces(
     smaller_meshes: list[pv.PolyData] = []
 
     for analysis in analyses:
-        is_extreme = analysis.bbox_aspect_ratio > EXTREME_ASPECT_RATIO_THRESHOLD
+        is_extreme = (
+            analysis.bbox_aspect_ratio > EXTREME_ASPECT_RATIO_THRESHOLD
+            or analysis.planarity_ratio < EXTREME_PLANARITY_RATIO
+        )
 
         if analysis.ratio >= average_ratio:
             offset_vector = extrusion_multiplier * analysis.extrusion_base_vector
@@ -1433,18 +3015,8 @@ def analyze_and_generate_surfaces(
             offset_vector = small_cell_extrusion_factor * extrusion_multiplier * analysis.extrusion_base_vector
             if is_extreme:
                 offset_vector = EXTREME_EXTRUSION_FACTOR * offset_vector
-                small_mesh, _, _ = _build_extreme_cell_lofts(
-                    analysis.followup_polyline,
-                    center=analysis.circle_center,
-                    plane_origin=analysis.plane_origin,
-                    plane_u=analysis.plane_u,
-                    plane_v=analysis.plane_v,
-                    plane_normal=analysis.plane_normal,
-                    offset_vector=offset_vector,
-                )
-            else:
-                moved_center = analysis.circle_center + offset_vector
-                small_mesh = _fan_surface_from_center(moved_center, analysis.discontinuity_points)
+            moved_center = analysis.circle_center + offset_vector
+            small_mesh = _fan_surface_from_center(moved_center, analysis.discontinuity_points)
             if _small_mesh_exceeds_retained_volume(
                 small_mesh,
                 loft_bounds=loft_bounds,
@@ -1672,8 +3244,11 @@ def _build_straight_polyline_from_discontinuities(
     points: np.ndarray,
     tolerance: float,
     discontinuity_angle_degrees: float,
+    forced_discontinuity_indices: set[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     discontinuity_indices = _detect_discontinuity_indices(points, discontinuity_angle_degrees)
+    if forced_discontinuity_indices:
+        discontinuity_indices = sorted(set(discontinuity_indices) | forced_discontinuity_indices)
     clustered_indices = _cluster_cyclic_indices(discontinuity_indices, len(points), max_gap=0)
     if len(clustered_indices) < 3:
         clustered_indices = _fallback_sample_indices(len(points), minimum_count=3)
@@ -2088,6 +3663,64 @@ def _close_polyline(points: np.ndarray, tolerance: float) -> np.ndarray:
     return np.vstack([points, points[0]])
 
 
+def _splice_points_into_polyline(
+    unique_pts: np.ndarray,
+    insertions: list[tuple[int, np.ndarray]],
+    tolerance: float,
+    *,
+    dedup_against_existing: bool = False,
+) -> np.ndarray:
+    """Insert points into a closed polyline, ordered by parametric t along each segment.
+
+    *insertions* is a list of ``(segment_index, point)`` pairs.  Points
+    targeting the same segment are sorted by their projection parameter
+    along that segment so they appear in the correct order.
+
+    When *dedup_against_existing* is True, points that are within
+    *tolerance* of an existing vertex or an already-queued insertion for
+    the same segment are silently dropped.
+
+    Returns a new unique-point array (NOT closed) ready for
+    ``_close_polyline``.
+    """
+    n = len(unique_pts)
+    if not insertions or n == 0:
+        return unique_pts.copy()
+
+    ins_by_seg: dict[int, list[np.ndarray]] = {}
+    for seg_idx, pt in insertions:
+        seg_idx = min(seg_idx, n - 1)
+        if seg_idx not in ins_by_seg:
+            ins_by_seg[seg_idx] = []
+        if dedup_against_existing:
+            already = any(float(np.linalg.norm(pt - ex)) < tolerance for ex in ins_by_seg[seg_idx])
+            near_existing = any(float(np.linalg.norm(pt - v)) < tolerance for v in unique_pts)
+            if already or near_existing:
+                continue
+        ins_by_seg[seg_idx].append(pt)
+
+    if not ins_by_seg:
+        return unique_pts.copy()
+
+    new_pts: list[np.ndarray] = []
+    for vi in range(n):
+        new_pts.append(unique_pts[vi])
+        if vi in ins_by_seg:
+            seg_start = unique_pts[vi]
+            seg_end = unique_pts[(vi + 1) % n]
+            seg_dir = seg_end - seg_start
+            seg_len_sq = max(float(np.dot(seg_dir, seg_dir)), 1e-20)
+            pts_t = [
+                (float(np.dot(pt - seg_start, seg_dir)) / seg_len_sq, pt)
+                for pt in ins_by_seg[vi]
+            ]
+            pts_t.sort(key=lambda x: x[0])
+            for _, pt in pts_t:
+                new_pts.append(pt)
+
+    return np.array(new_pts, dtype=float)
+
+
 def _sanitize_closed_polyline(polyline: np.ndarray, tolerance: float) -> np.ndarray:
     unique_points = _unique_polyline_points(polyline, tolerance=tolerance)
     if len(unique_points) == 0:
@@ -2349,15 +3982,25 @@ def _sort_polygon_by_angle(center: np.ndarray, polygon_points: np.ndarray) -> np
 
 
 
+def _strip_stale_cell_arrays(mesh: pv.PolyData) -> pv.PolyData:
+    """Remove cell-data arrays whose length doesn't match n_cells."""
+    for name in list(mesh.cell_data.keys()):
+        if len(mesh.cell_data[name]) != mesh.n_cells:
+            del mesh.cell_data[name]
+    return mesh
+
+
 def _merge_meshes(meshes: list[pv.PolyData]) -> pv.PolyData:
-    non_empty = [mesh for mesh in meshes if mesh.n_cells > 0]
+    non_empty = [_strip_stale_cell_arrays(mesh) for mesh in meshes if mesh.n_cells > 0]
     if not non_empty:
         return pv.PolyData()
 
-    merged = non_empty[0].copy()
-    for mesh in non_empty[1:]:
-        merged = merged.merge(mesh)
-    return merged.clean()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*PolyData.*not valid.*vtkOriginalCellIds.*")
+        merged = non_empty[0].copy()
+        for mesh in non_empty[1:]:
+            merged = merged.merge(mesh)
+    return _strip_stale_cell_arrays(merged).clean()
 
 
 def _bounds_overlap(
@@ -2372,3 +4015,8 @@ def _bounds_overlap(
         or first[5] < second[4]
         or second[5] < first[4]
     )
+
+
+def default_snap_tolerance(tolerance: float) -> float:
+    """Canonical snap tolerance derived from the base line tolerance."""
+    return max(20.0 * tolerance, 0.02)

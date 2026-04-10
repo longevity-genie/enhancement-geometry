@@ -1,0 +1,21 @@
+{
+  "radii": [
+    15.108,
+    15.567,
+    31.134,
+    19.134,
+    15.409,
+    17.249,
+    22.514,
+    18.677
+  ],
+  "z_increment": 5.720000000000001,
+  "seed_count": 66,
+  "random_seed": 4096,
+  "extrusion_multiplier": -0.4,
+  "scale_x": 0.5,
+  "scale_y": 0.5,
+  "circle_resolution": 120,
+  "bbox_padding": 4.0,
+  "line_tolerance": 0.001
+}

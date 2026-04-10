@@ -35,13 +35,22 @@ class PipelineConfig:
     circle_resolution: int = 120
     bbox_padding: float = 4.0
     line_tolerance: float = 0.001
+    # When set (e.g. after radii smoothing), non-uniform Z ring positions; else derived from z_increment.
+    z_levels: tuple[float, ...] | None = None
 
     @property
     def effective_extrusion(self) -> float:
         return 5.0 * self.extrusion_multiplier
 
-    def to_surface_config(self) -> LoftedVoronoiConfig:
-        z_levels = tuple(i * self.z_increment for i in range(len(self.radii)))
+    def to_surface_config(
+        self,
+        z_levels_override: tuple[float, ...] | None = None,
+    ) -> LoftedVoronoiConfig:
+        z_levels = (
+            z_levels_override
+            or self.z_levels
+            or tuple(i * self.z_increment for i in range(len(self.radii)))
+        )
         return LoftedVoronoiConfig(
             radii=self.radii,
             z_levels=z_levels,
@@ -63,7 +72,7 @@ class PipelineConfig:
         return replace(self, random_seed=new_seed)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "radii": list(self.radii),
             "z_increment": self.z_increment,
             "seed_count": self.seed_count,
@@ -75,11 +84,22 @@ class PipelineConfig:
             "bbox_padding": self.bbox_padding,
             "line_tolerance": self.line_tolerance,
         }
+        if self.z_levels is not None:
+            d["z_levels"] = list(self.z_levels)
+        return d
 
 
-def validate_geometry_limits(radii: tuple[float, ...], z_increment: float) -> tuple[float, float]:
+def validate_geometry_limits(
+    radii: tuple[float, ...],
+    z_increment: float,
+    *,
+    z_levels: tuple[float, ...] | None = None,
+) -> tuple[float, float]:
     max_width = 2.0 * max(radii)
-    max_height = z_increment * (len(radii) - 1)
+    if z_levels is not None and len(z_levels) >= 2:
+        max_height = float(max(z_levels) - min(z_levels))
+    else:
+        max_height = z_increment * (len(radii) - 1)
     if max_width > MAX_MODEL_SPAN + 1e-9:
         raise ValueError(
             f"The widest circle would produce {max_width:.2f} units in width, "
@@ -121,6 +141,12 @@ def load_pipeline_config(
 def load_pipeline_config_from_saved(path: str | Path) -> PipelineConfig:
     """Load a PipelineConfig from a previously-saved config JSON file."""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    z_levels_raw = raw.get("z_levels")
+    z_levels: tuple[float, ...] | None
+    if z_levels_raw is not None:
+        z_levels = tuple(float(v) for v in z_levels_raw)
+    else:
+        z_levels = None
     return PipelineConfig(
         radii=tuple(float(v) for v in raw["radii"]),
         z_increment=float(raw["z_increment"]),
@@ -132,6 +158,7 @@ def load_pipeline_config_from_saved(path: str | Path) -> PipelineConfig:
         circle_resolution=int(raw.get("circle_resolution", 120)),
         bbox_padding=float(raw.get("bbox_padding", 4.0)),
         line_tolerance=float(raw.get("line_tolerance", 0.001)),
+        z_levels=z_levels,
     )
 
 

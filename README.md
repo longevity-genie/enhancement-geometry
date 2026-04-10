@@ -2,6 +2,8 @@
 
 Generate **3D-printable voronoi shell geometry** from parametric inputs. Each run produces a unique shape driven by radius, spacing, seed, and extrusion parameters, exported as STL.
 
+> **Full API reference:** see [API.md](API.md) for complete documentation of all functions, dataclasses, constants, and CLI options.
+
 ## Quick start
 
 ```bash
@@ -106,7 +108,35 @@ Circle radius is constrained to **5–75** units.
 
 ## Geometric constraints
 
-The pipeline automatically detects and handles cells that would produce degenerate geometry. Each cell's intersection curve is analyzed with a best-fit plane and an oriented bounding box in the `(U, V, normal)` frame of that plane.
+The pipeline automatically detects and corrects geometry that would produce degenerate results. There are two levels of correction: **radii smoothing** (pre-loft, adjusts inputs) and **extreme cell handling** (post-intersection, adjusts per-cell processing).
+
+### Radii smoothing (pre-loft)
+
+Before building the loft, consecutive radii are checked for steep transitions. When the larger radius is >= 2.5x the smaller one, the resulting loft slope is nearly vertical and voronoi cell intersections become degenerate.
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Trigger** | `max(r_i, r_{i+1}) / min(r_i, r_{i+1}) >= 2.5` | Consecutive radii ratio that activates smoothing |
+| **Radius fix** | Smaller radius raised to `larger / 2.0` | Brings the pair ratio down to 2:1 |
+| **Spacing fix** | Per-interval caps and vertex widening (see below) | Runs in the **same pass** as the 2.5:1 radius fix once any steep pair exists |
+
+When smoothing activates, **every** profile segment with a meaningful `|Δr|` gets a maximum `dz` so the segment stays at least **25°** from vertical (`dz ≤ |Δr| / tan(25°)`). That can **reduce** overly large steps. At interior rings that touch a steep interval, if the angle between the two consecutive profile segments would stay below **50°**, **both** adjacent spacings are **increased** (by `VERTEX_WIDEN_FACTOR` per iteration, up to each segment’s max `dz`) so the corner opens—never shrunk for that purpose alone.
+
+The smoothing runs automatically in the CLI pipeline. In the notebook, a dedicated cell shows a side-by-side comparison of the original vs adjusted loft (red vs green), and offers an "Apply adjustments & save config" button to update the sliders and persist the corrected values.
+
+Constants are defined in `smoothing.py`:
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MAX_CONSECUTIVE_RATIO` | 2.5 | Ratio threshold that triggers smoothing |
+| `TARGET_RATIO` | 2.0 | Target ratio after smoothing the smaller radius |
+| `MIN_ANGLE_FROM_VERTICAL_DEG` | 25 | Minimum angle between vertical and each profile segment (when `|Δr|` is significant vs radius); sets max `dz` per segment |
+| `MIN_ANGLE_BETWEEN_SEGMENTS_DEG` | 50 | Target minimum angle between consecutive profile segments at vertices touched by steep intervals |
+| `VERTEX_WIDEN_FACTOR` | 1.03 | Multiplier applied to **both** adjacent spacings when widening an acute vertex |
+
+### Cell classification (post-intersection)
+
+Each cell's intersection curve is analyzed with a best-fit plane and an oriented bounding box in the `(U, V, normal)` frame of that plane.
 
 ### Cell classification
 
@@ -121,13 +151,13 @@ Classification rules:
 
 | Category | Condition | Surface method |
 |----------|-----------|----------------|
-| **Large** | ratio >= mean AND aspect ratio <= 3.0 | Staged offset lofts (scale 0.5, then 0.45) |
-| **Small** | ratio < mean AND aspect ratio <= 3.0 | Triangle fan from offset center |
-| **Extreme** | aspect ratio > 3.0 (any ratio) | Extreme cell lofts (see below) |
+| **Large** | ratio >= mean AND aspect ratio <= 2.5 | Staged offset lofts (scale 0.5, then 0.45) |
+| **Small** | ratio < mean AND aspect ratio <= 2.5 | Triangle fan from offset center |
+| **Extreme** | aspect ratio > 2.5 (any ratio) | Extreme cell lofts (see below) |
 
 ### Extreme cell handling
 
-When a cell's bounding box aspect ratio exceeds **3.0**, it is classified as extreme regardless of its volume/length ratio. Extreme cells get three corrections to prevent spiky, degenerate geometry:
+When a cell's bounding box aspect ratio exceeds **2.5**, it is classified as extreme regardless of its volume/length ratio. Extreme cells get three corrections to prevent spiky, degenerate geometry:
 
 | Correction | Value | Effect |
 |------------|-------|--------|
@@ -143,7 +173,7 @@ These values are defined in `lofted_surface_voronoi.py`:
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `EXTREME_ASPECT_RATIO_THRESHOLD` | 3.0 | Bbox aspect ratio above which a cell is classified as extreme |
+| `EXTREME_ASPECT_RATIO_THRESHOLD` | 2.5 | Bbox aspect ratio above which a cell is classified as extreme |
 | `EXTREME_SCALE_FACTOR` | 0.3 | Inner curve scale factor for extreme cells (vs 0.5 default) |
 | `EXTREME_EXTRUSION_FACTOR` | 0.5 | Multiplier applied to the extrusion offset for extreme cells |
 | `MIN_RADIUS` | 5.0 | Minimum allowed circle radius |
@@ -164,6 +194,7 @@ compass-web/
 │   ├── __init__.py                         # Public API exports
 │   ├── lofted_surface_voronoi.py           # Core geometry functions (loft, voronoi, mesh ops)
 │   ├── config.py                           # PipelineConfig dataclass, JSON I/O, config management
+│   ├── smoothing.py                        # Radii/spacing smoothing to prevent steep loft slopes
 │   ├── pipeline.py                         # End-to-end pipeline orchestration and export
 │   ├── visualization.py                    # Camera, bounds, scene rendering, PyVista viewers
 │   └── cli.py                              # Typer CLI (generate, view, config management)
@@ -175,6 +206,7 @@ compass-web/
 
 - **`lofted_surface_voronoi`** — All low-level geometry: circle sampling, loft construction, Voronoi cell building, surface intersection, mesh cleanup, naked edge handling, mesh repair, and STL export primitives.
 - **`config`** — `PipelineConfig` dataclass unifying all parameters for a run, with JSON serialization and duplicate-aware saving.
+- **`smoothing`** — Pre-loft radii and spacing correction. Detects consecutive radii with >= 2.5:1 ratio and smooths them to 2:1; in the same pass, spacing is capped for 25° from vertical and, where needed, adjacent intervals are widened (up to cap) so consecutive segments reach at least ~50° at rings touched by steep intervals.
 - **`pipeline`** — `run_pipeline()` and `run_pipeline_with_retry()` orchestrate the full pipeline from config to trimesh result. `export_stl()` writes the output.
 - **`visualization`** — Camera positioning, bounds helpers, static PNG rendering, and interactive VTK viewer windows.
 - **`cli`** — Typer-based CLI with `generate`, `view`, `new-config`, `show-config`, and `list-configs` commands.
