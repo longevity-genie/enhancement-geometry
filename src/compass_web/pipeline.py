@@ -7,6 +7,7 @@ solids -> export.  It is designed to work both from the notebook and from CLI.
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +16,8 @@ from pathlib import Path
 import numpy as np
 import pyvista as pv
 import trimesh
+
+logger = logging.getLogger(__name__)
 
 from compass_web.config import PipelineConfig, SMALL_CELL_EXTRUSION_FACTOR
 from compass_web.lofted_surface_voronoi import (
@@ -170,8 +173,12 @@ def build_export_trimesh(solids_list: list[pv.PolyData]) -> trimesh.Trimesh:
     """Convert a list of PyVista cell solids into a single trimesh, with
     outward normals and fixed winding, rotated for printing (sliced face
     on XY).
+
+    Individual cells that fail ``is_volume`` after normal repair are dropped
+    to prevent one broken cell from poisoning the combined mesh.
     """
     cell_tms: list[trimesh.Trimesh] = []
+    dropped = 0
     for solid in solids_list:
         solid_o = orient_normals_outward(solid)
         pts = np.asarray(solid_o.points, dtype=float)
@@ -190,7 +197,17 @@ def build_export_trimesh(solids_list: list[pv.PolyData]) -> trimesh.Trimesh:
         )
         trimesh.repair.fix_normals(tm)
         trimesh.repair.fix_winding(tm)
-        cell_tms.append(tm)
+        if tm.is_volume:
+            cell_tms.append(tm)
+        else:
+            dropped += 1
+
+    if dropped > 0:
+        logger.info("build_export_trimesh: dropped %d/%d cells with broken normals",
+                     dropped, dropped + len(cell_tms))
+
+    if not cell_tms:
+        return trimesh.Trimesh()
 
     combined = trimesh.util.concatenate(cell_tms)
     trimesh.repair.fix_normals(combined, multibody=True)
