@@ -12,6 +12,8 @@ import pyvista as pv
 import vtk
 from scipy.spatial import ConvexHull, HalfspaceIntersection
 from scipy.spatial.distance import cdist
+from shapely import STRtree
+from shapely.geometry import LineString as _ShapelyLine
 
 MIN_RADIUS = 5.0
 MAX_RADIUS = 75.0
@@ -1559,34 +1561,82 @@ def _find_cross_polyline_intersections(
     Returns a mapping ``{polyline_index: [(segment_index, crossing_point), ...]}``.
     Each crossing is recorded for BOTH involved polylines so both can insert
     the crossing vertex during rebuild.
+
+    Uses a Shapely STRtree with ``predicate='crosses'`` as a fast C-level
+    pre-filter to reduce O(n^2 * e^2) Python iterations to a small candidate
+    set, then confirms each candidate with the original ``_segment_crossing_3d``
+    3D check to preserve exact semantics (including the 3D skewness tolerance).
     """
     cross_tol = tolerance * 50
     result: dict[int, list[tuple[int, np.ndarray]]] = {
         i: [] for i in range(len(unique_point_lists))
     }
 
-    for ia in range(len(unique_point_lists)):
-        pts_a = unique_point_lists[ia]
-        na = len(pts_a)
-        if na < 2:
+    n_poly = len(unique_point_lists)
+    if n_poly < 2:
+        return result
+
+    # Build flat segment list: one Shapely LineString per edge, projected to XY.
+    seg_shapes: list[_ShapelyLine] = []
+    seg_meta: list[tuple[int, int]] = []  # (polyline_idx, segment_idx)
+    seg_3d_starts: list[np.ndarray] = []
+    seg_3d_ends: list[np.ndarray] = []
+
+    for pi, pts in enumerate(unique_point_lists):
+        n = len(pts)
+        if n < 2:
             continue
-        for ib in range(ia + 1, len(unique_point_lists)):
-            pts_b = unique_point_lists[ib]
-            nb = len(pts_b)
-            if nb < 2:
+        for si in range(n):
+            si_next = (si + 1) % n
+            p0, p1 = pts[si], pts[si_next]
+            dx, dy = float(p1[0] - p0[0]), float(p1[1] - p0[1])
+            if dx * dx + dy * dy < 1e-20:
                 continue
-            for sa in range(na):
-                sa_next = (sa + 1) % na
-                for sb in range(nb):
-                    sb_next = (sb + 1) % nb
-                    pt = _segment_crossing_3d(
-                        pts_a[sa], pts_a[sa_next],
-                        pts_b[sb], pts_b[sb_next],
-                        cross_tol,
-                    )
-                    if pt is not None:
-                        result[ia].append((sa, pt))
-                        result[ib].append((sb, pt))
+            seg_shapes.append(
+                _ShapelyLine([(float(p0[0]), float(p0[1])), (float(p1[0]), float(p1[1]))])
+            )
+            seg_meta.append((pi, si))
+            seg_3d_starts.append(p0)
+            seg_3d_ends.append(p1)
+
+    if len(seg_shapes) < 2:
+        return result
+
+    tree = STRtree(seg_shapes)
+
+    # predicate='crosses' is a fast C-level pre-filter: keeps only segments
+    # whose XY projections geometrically cross (interior-to-interior, no
+    # endpoint touches). This reduces candidates from O(n^2) to O(n log n)
+    # before the 3D verification step.
+    left_idx, right_idx = tree.query(seg_shapes, predicate="crosses")
+
+    processed: set[tuple[int, int]] = set()
+
+    for li, ri in zip(left_idx, right_idx):
+        if li >= ri:
+            continue  # process each unordered pair once; skip self-hits
+        pi_a, si_a = seg_meta[li]
+        pi_b, si_b = seg_meta[ri]
+        if pi_a == pi_b:
+            continue  # same polyline — not a cross-polyline crossing
+
+        pair = (li, ri)
+        if pair in processed:
+            continue
+        processed.add(pair)
+
+        # 3D confirmation: rejects XY crossings that are far apart in Z
+        # (e.g., segments from different height levels of the lofted surface).
+        pt3d = _segment_crossing_3d(
+            seg_3d_starts[li], seg_3d_ends[li],
+            seg_3d_starts[ri], seg_3d_ends[ri],
+            cross_tol,
+        )
+        if pt3d is None:
+            continue
+
+        result[pi_a].append((si_a, pt3d))
+        result[pi_b].append((si_b, pt3d))
 
     return result
 
@@ -2428,6 +2478,16 @@ def close_free_vertices(
 
     insertions: dict[int, list[tuple[int, np.ndarray]]] = {}
 
+    from scipy.spatial import cKDTree
+    centroids = np.array([
+        _unique_polyline_points(result[i], tolerance).mean(axis=0)
+        if len(_unique_polyline_points(result[i], tolerance)) >= 3
+        else np.full(3, np.inf)
+        for i in range(len(result))
+    ])
+    centroid_tree = cKDTree(centroids[np.isfinite(centroids[:, 0])])
+    valid_centroid_map = np.where(np.isfinite(centroids[:, 0]))[0]
+
     for ci in range(len(result)):
         u = _unique_polyline_points(result[ci], tolerance)
         if len(u) < 3:
@@ -2454,6 +2514,8 @@ def close_free_vertices(
             cell_radius * 0.5,
         )
 
+        nbr_set = set(neighbours.get(ci, []))
+
         for fi in free_indices:
             if _is_on_surface_boundary(u_copy[fi], boundary_pts, snap_tolerance * 5):
                 continue
@@ -2463,15 +2525,18 @@ def close_free_vertices(
             )
 
             if best_dist > nbr_snap_limit:
+                search_radius = max(cell_radius * 2.0, extended_snap_limit * 2.0)
+                nearby_tree_indices = centroid_tree.query_ball_point(u_copy[fi], search_radius)
                 non_nbr_candidates = [
-                    oi for oi in range(len(result))
-                    if oi != ci and oi not in neighbours.get(ci, [])
+                    int(valid_centroid_map[ti]) for ti in nearby_tree_indices
+                    if int(valid_centroid_map[ti]) != ci and int(valid_centroid_map[ti]) not in nbr_set
                 ]
-                ext_dist, ext_pt, ext_nbr, ext_seg = _find_nearest_segment_on_cells(
-                    u_copy[fi], non_nbr_candidates, result, tolerance,
-                )
-                if ext_dist < best_dist:
-                    best_dist, best_pt, best_nbr, best_seg_idx = ext_dist, ext_pt, ext_nbr, ext_seg
+                if non_nbr_candidates:
+                    ext_dist, ext_pt, ext_nbr, ext_seg = _find_nearest_segment_on_cells(
+                        u_copy[fi], non_nbr_candidates, result, tolerance,
+                    )
+                    if ext_dist < best_dist:
+                        best_dist, best_pt, best_nbr, best_seg_idx = ext_dist, ext_pt, ext_nbr, ext_seg
 
             snap_limit = extended_snap_limit if best_dist > nbr_snap_limit else nbr_snap_limit
             if best_dist < snap_limit and best_nbr >= 0:
@@ -2657,26 +2722,31 @@ def _absorb_nearby_neighbour_vertices(
             n_to_c_dists = cdist(u_n, u_c)
             n_min_dists = n_to_c_dists.min(axis=1)
 
-            for vi in range(len(u_n)):
-                if n_min_dists[vi] < snap_tolerance:
-                    continue
-                pt = u_n[vi]
+            candidate_mask = n_min_dists >= snap_tolerance
+            candidate_indices = np.where(candidate_mask)[0]
+            if len(candidate_indices) == 0:
+                continue
 
-                best_seg = -1
-                best_d = float("inf")
-                for si in range(len(closed_c) - 1):
-                    d = _distance_point_to_segment(pt, closed_c[si], closed_c[si + 1])
-                    if d < best_d:
-                        best_d = d
-                        best_seg = si
+            n_segs = len(closed_c) - 1
+            if n_segs > 0:
+                seg_dists = _distances_points_to_segments(
+                    u_n[candidate_indices],
+                    closed_c[:-1],
+                    closed_c[1:],
+                )
+                best_segs = seg_dists.argmin(axis=1)
+                best_ds = seg_dists[np.arange(len(candidate_indices)), best_segs]
 
-                if best_d < absorb_limit and best_seg >= 0:
+                for k, vi in enumerate(candidate_indices):
+                    if best_ds[k] >= absorb_limit:
+                        continue
+                    pt = u_n[vi]
                     already = any(
                         float(np.linalg.norm(pt - ip)) < tolerance
                         for _, ip in to_insert
                     )
                     if not already:
-                        to_insert.append((best_seg, pt.copy()))
+                        to_insert.append((int(best_segs[k]), pt.copy()))
 
         if not to_insert:
             continue
@@ -2771,6 +2841,39 @@ def _distance_point_to_segment(
     t = max(0.0, min(1.0, float(np.dot(point - seg_a, ab)) / ab_sq))
     proj = seg_a + t * ab
     return float(np.linalg.norm(point - proj))
+
+
+def _distances_points_to_segments(
+    points: np.ndarray,
+    seg_starts: np.ndarray,
+    seg_ends: np.ndarray,
+) -> np.ndarray:
+    """Vectorized distance from each point to each segment.
+
+    Returns shape ``(n_points, n_segments)``.
+    """
+    ab = seg_ends - seg_starts  # (S, 3)
+    ab_sq = np.einsum("ij,ij->i", ab, ab)  # (S,)
+
+    ap = points[:, None, :] - seg_starts[None, :, :]  # (P, S, 3)
+    dot_ap_ab = np.einsum("ijk,jk->ij", ap, ab)  # (P, S)
+
+    safe_ab_sq = np.where(ab_sq < 1e-20, 1.0, ab_sq)
+    t = dot_ap_ab / safe_ab_sq[None, :]  # (P, S)
+    t = np.clip(t, 0.0, 1.0)
+
+    proj = seg_starts[None, :, :] + t[:, :, None] * ab[None, :, :]  # (P, S, 3)
+    diff = points[:, None, :] - proj  # (P, S, 3)
+    dists = np.sqrt(np.einsum("ijk,ijk->ij", diff, diff))  # (P, S)
+
+    degenerate = ab_sq < 1e-20
+    if np.any(degenerate):
+        deg_dists = np.linalg.norm(
+            points[:, None, :] - seg_starts[None, degenerate, :], axis=2
+        )
+        dists[:, degenerate] = deg_dists
+
+    return dists
 
 
 def _project_point_to_nearest_segment(
@@ -3314,14 +3417,14 @@ def _snap_neighboring_polyline_points(
             parents[root_second] = root_first
             ranks[root_first] += 1
 
-    for first_index, first_point in enumerate(points_array[:-1]):
-        first_polyline_index, _ = point_refs[first_index]
-        for second_index in range(first_index + 1, len(points_array)):
-            second_polyline_index, _ = point_refs[second_index]
-            if first_polyline_index == second_polyline_index:
-                continue
-            if float(np.linalg.norm(first_point - points_array[second_index])) <= snap_tolerance:
-                union(first_index, second_index)
+    poly_indices = np.array([pr[0] for pr in point_refs], dtype=int)
+    dist_matrix = cdist(points_array, points_array)
+    close_pairs = np.argwhere(
+        (dist_matrix <= snap_tolerance) & (np.arange(len(points_array))[:, None] < np.arange(len(points_array))[None, :])
+    )
+    for first_index, second_index in close_pairs:
+        if poly_indices[first_index] != poly_indices[second_index]:
+            union(first_index, second_index)
 
     cluster_members: dict[int, list[int]] = defaultdict(list)
     for index in range(len(points_array)):
