@@ -468,6 +468,9 @@ def run_pipeline(
         print(f"Voronoi seeds: {point_config.seed_count}, random seed: {point_config.random_seed}")
         print(f"Extrusion: {extrusion_multiplier:.2f}, Scale X: {scale_x:.2f}, Scale Y: {scale_y:.2f}")
 
+    import time as _time
+    _t0 = _time.perf_counter()
+
     full_surface = build_lofted_surface(surface_config)
     full_loft_bounds = full_surface.bounds
     loft_bbox_center = np.array([
@@ -498,6 +501,10 @@ def run_pipeline(
     )
     closed_polylines, _, _ = filter_isolated_polylines(raw_polylines, tolerance=tolerance)
 
+    _t1 = _time.perf_counter()
+    if verbose:
+        print(f"  [timing] Loft+voronoi+intersect: {_t1-_t0:.2f}s")
+
     closed_polylines, compact_removed, compact_msgs = compact_polyline_shapes(
         closed_polylines, tolerance=tolerance,
     )
@@ -519,11 +526,20 @@ def run_pipeline(
     if verbose and elongated_removed > 0:
         print(f"Removed {elongated_removed} extreme elongated polyline(s) (WR < {ELONGATED_WIDTH_RATIO_THRESHOLD})")
 
+    _t2 = _time.perf_counter()
+    if verbose:
+        print(f"  [timing] Compact+rebuild+filter: {_t2-_t1:.2f}s")
+
     pre_alignment_polylines = [p.copy() for p in closed_polylines]
+
+    polyline_neighbours = find_polyline_neighbours(
+        closed_polylines, polyline_snap_tolerance,
+    )
 
     closed_polylines = align_neighbouring_polylines(
         closed_polylines, tolerance=tolerance,
         slice_plane_x=float(surface_config.slice_origin[0]),
+        neighbours=polyline_neighbours,
     )
 
     max_shift = 0.0
@@ -540,13 +556,32 @@ def run_pipeline(
         else:
             print("Neighbour edge alignment: no adjustment needed")
 
+    _t3 = _time.perf_counter()
+    if verbose:
+        print(f"  [timing] Align neighbours: {_t3-_t2:.2f}s")
+
+    pre_overlap_count = len(closed_polylines)
     closed_polylines, overlap_relocated, overlap_messages = fix_polyline_surface_overlaps(
-        closed_polylines, tolerance=tolerance,
+        closed_polylines, tolerance=tolerance, neighbours=polyline_neighbours,
     )
+
+    if len(closed_polylines) != pre_overlap_count:
+        polyline_neighbours = find_polyline_neighbours(
+            closed_polylines, polyline_snap_tolerance,
+        )
+
+    _t4 = _time.perf_counter()
+    if verbose:
+        print(f"  [timing] Fix overlaps: {_t4-_t3:.2f}s")
 
     closed_polylines, free_snapped, free_msgs = close_free_vertices(
         closed_polylines, half_surface, tolerance=tolerance,
+        neighbours=polyline_neighbours,
     )
+
+    _t5 = _time.perf_counter()
+    if verbose:
+        print(f"  [timing] Close free vertices: {_t5-_t4:.2f}s")
 
     if verbose:
         if overlap_relocated > 0 or overlap_messages:
@@ -618,6 +653,11 @@ def run_pipeline(
             is_valid_volume=False,
             stats={"polyline_count": len(closed_polylines), "cell_solid_count": 0},
         )
+
+    _t6 = _time.perf_counter()
+    if verbose:
+        print(f"  [timing] Analyze+build+solidify: {_t6-_t5:.2f}s")
+        print(f"  [timing] TOTAL: {_t6-_t0:.2f}s")
 
     generated_surface = _merge_meshes([s for s in cell_solids if s.n_cells > 0])
     result_mesh = build_export_trimesh(cell_solids)

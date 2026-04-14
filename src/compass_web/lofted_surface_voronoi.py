@@ -11,6 +11,7 @@ import numpy as np
 import pyvista as pv
 import vtk
 from scipy.spatial import ConvexHull, HalfspaceIntersection
+from scipy.spatial.distance import cdist
 
 MIN_RADIUS = 5.0
 MAX_RADIUS = 75.0
@@ -1608,11 +1609,7 @@ def _inject_crossing_points(
     insertions: list[tuple[int, np.ndarray]] = []
     for seg_idx, pt in crossings:
         seg_idx = min(seg_idx, n - 1)
-        near_existing = any(
-            float(np.linalg.norm(pt - unique_points[k])) < tolerance
-            for k in range(n)
-        )
-        if near_existing:
+        if n > 0 and float(np.min(np.linalg.norm(unique_points - pt, axis=1))) < tolerance:
             continue
         already = any(
             float(np.linalg.norm(pt - ip)) < tolerance for _, ip in insertions
@@ -1714,6 +1711,7 @@ def align_neighbouring_polylines(
     tolerance: float,
     snap_tolerance: float | None = None,
     slice_plane_x: float | None = None,
+    neighbours: dict[int, list[int]] | None = None,
 ) -> list[np.ndarray]:
     """Align shared-edge segments between neighboring polylines.
 
@@ -1740,7 +1738,8 @@ def align_neighbouring_polylines(
     if len(polylines) < 2:
         return [p.copy() for p in polylines]
 
-    neighbours = find_polyline_neighbours(polylines, snap_tolerance)
+    if neighbours is None:
+        neighbours = find_polyline_neighbours(polylines, snap_tolerance)
 
     seg_updates: dict[int, dict[tuple[int, int], np.ndarray]] = {
         i: {} for i in range(len(polylines))
@@ -1776,21 +1775,18 @@ def _find_shared_vertex_pairs(
     tolerance: float,
 ) -> list[tuple[int, int]]:
     """Return ``(index_in_a, index_in_b)`` pairs of shared vertices."""
+    if len(pts_a) == 0 or len(pts_b) == 0:
+        return []
+    dists = cdist(pts_a, pts_b)
     pairs: list[tuple[int, int]] = []
-    used_b: set[int] = set()
+    used_b = np.zeros(len(pts_b), dtype=bool)
     for ia in range(len(pts_a)):
-        best_ib = -1
-        best_dist = float("inf")
-        for ib in range(len(pts_b)):
-            if ib in used_b:
-                continue
-            d = float(np.linalg.norm(pts_a[ia] - pts_b[ib]))
-            if d < best_dist and d <= tolerance:
-                best_dist = d
-                best_ib = ib
-        if best_ib >= 0:
-            pairs.append((ia, best_ib))
-            used_b.add(best_ib)
+        row = dists[ia].copy()
+        row[used_b] = np.inf
+        ib = int(row.argmin())
+        if row[ib] <= tolerance:
+            pairs.append((ia, ib))
+            used_b[ib] = True
     return pairs
 
 
@@ -1857,6 +1853,7 @@ def _find_edge_crossings(
     crossings: list[np.ndarray] = []
     na, nb = len(pts_a), len(pts_b)
     cross_tol = tolerance * 50
+    shared_arr = np.array(shared_positions) if shared_positions else np.empty((0, 3))
 
     for ia in range(na):
         ia_next = (ia + 1) % na
@@ -1869,11 +1866,9 @@ def _find_edge_crossings(
             )
             if pt is None:
                 continue
-            near_shared = any(
-                float(np.linalg.norm(pt - sp)) < cross_tol for sp in shared_positions
-            )
-            if not near_shared:
-                crossings.append(pt)
+            if len(shared_arr) > 0 and float(np.min(np.linalg.norm(shared_arr - pt, axis=1))) < cross_tol:
+                continue
+            crossings.append(pt)
 
     return crossings
 
@@ -2106,6 +2101,7 @@ def validate_polyline_surfaces(
     polylines: list[np.ndarray],
     tolerance: float,
     snap_tolerance: float | None = None,
+    neighbours: dict[int, list[int]] | None = None,
 ) -> list[tuple[int, int, bool, int]]:
     """Check every neighbour pair for fan-surface overlaps.
 
@@ -2120,7 +2116,8 @@ def validate_polyline_surfaces(
     if snap_tolerance is None:
         snap_tolerance = default_snap_tolerance(tolerance)
 
-    neighbours = find_polyline_neighbours(polylines, snap_tolerance)
+    if neighbours is None:
+        neighbours = find_polyline_neighbours(polylines, snap_tolerance)
     results: list[tuple[int, int, bool, int]] = []
     processed: set[tuple[int, int]] = set()
 
@@ -2178,6 +2175,7 @@ def fix_polyline_surface_overlaps(
     tolerance: float,
     snap_tolerance: float | None = None,
     max_iterations: int = 5,
+    neighbours: dict[int, list[int]] | None = None,
 ) -> tuple[list[np.ndarray], int, list[str]]:
     """Fix overlapping neighbour surfaces by relocating offending vertices.
 
@@ -2196,8 +2194,10 @@ def fix_polyline_surface_overlaps(
     total_relocated = 0
     messages: list[str] = []
 
-    for iteration in range(max_iterations):
+    if neighbours is None:
         neighbours = find_polyline_neighbours(result, snap_tolerance)
+
+    for iteration in range(max_iterations):
         relocated_this_round = 0
         processed: set[tuple[int, int]] = set()
 
@@ -2219,9 +2219,9 @@ def fix_polyline_surface_overlaps(
         if relocated_this_round == 0:
             break
 
-    result = _resnap_shared_vertices(result, tolerance, snap_tolerance)
+    result = _resnap_shared_vertices(result, tolerance, snap_tolerance, neighbours=neighbours)
 
-    result, pocket_removed, pocket_msgs = resolve_pocket_cells(result, tolerance, snap_tolerance)
+    result, pocket_removed, pocket_msgs = resolve_pocket_cells(result, tolerance, snap_tolerance, neighbours=neighbours)
     messages.extend(pocket_msgs)
 
     restored = 0
@@ -2240,11 +2240,13 @@ def _resnap_shared_vertices(
     polylines: list[np.ndarray],
     tolerance: float,
     snap_tolerance: float,
+    neighbours: dict[int, list[int]] | None = None,
 ) -> list[np.ndarray]:
     """Re-snap shared vertices between neighbours to close gaps."""
     unique_lists = [_unique_polyline_points(p, tolerance).copy() for p in polylines]
     closed_for_query = [_close_polyline(u, tolerance) for u in unique_lists]
-    neighbours = find_polyline_neighbours(closed_for_query, snap_tolerance)
+    if neighbours is None:
+        neighbours = find_polyline_neighbours(closed_for_query, snap_tolerance)
 
     processed: set[tuple[int, int]] = set()
     for idx_a, nbrs in sorted(neighbours.items()):
@@ -2269,6 +2271,7 @@ def resolve_pocket_cells(
     polylines: list[np.ndarray],
     tolerance: float,
     snap_tolerance: float | None = None,
+    neighbours: dict[int, list[int]] | None = None,
 ) -> tuple[list[np.ndarray], list[int], list[str]]:
     """Remove pocket cells that are fully enclosed by a single larger neighbour.
 
@@ -2284,7 +2287,8 @@ def resolve_pocket_cells(
     if snap_tolerance is None:
         snap_tolerance = default_snap_tolerance(tolerance)
 
-    neighbours = find_polyline_neighbours(polylines, snap_tolerance)
+    if neighbours is None:
+        neighbours = find_polyline_neighbours(polylines, snap_tolerance)
     pocket_indices: set[int] = set()
     messages: list[str] = []
 
@@ -2394,6 +2398,7 @@ def close_free_vertices(
     surface: pv.PolyData,
     tolerance: float,
     snap_tolerance: float | None = None,
+    neighbours: dict[int, list[int]] | None = None,
 ) -> tuple[list[np.ndarray], int, list[str]]:
     """Snap free vertices of interior cells to neighbour edges and insert
     the snapped point into the neighbour's polyline so both cells share it.
@@ -2415,7 +2420,8 @@ def close_free_vertices(
         snap_tolerance = default_snap_tolerance(tolerance)
 
     result = [p.copy() for p in polylines]
-    neighbours = find_polyline_neighbours(result, snap_tolerance)
+    if neighbours is None:
+        neighbours = find_polyline_neighbours(result, snap_tolerance)
     boundary_pts = _surface_boundary_points(surface, snap_tolerance)
     messages: list[str] = []
     total_snapped = 0
@@ -2490,8 +2496,11 @@ def close_free_vertices(
         messages.append(f"Snapped {total_snapped} free vertices to neighbour edges")
 
     total_absorbed = 0
+    absorb_neighbours = find_polyline_neighbours(result, snap_tolerance)
     for _absorb_pass in range(5):
-        result, absorbed = _absorb_nearby_neighbour_vertices(result, tolerance, snap_tolerance)
+        result, absorbed = _absorb_nearby_neighbour_vertices(
+            result, tolerance, snap_tolerance, neighbours=absorb_neighbours,
+        )
         total_absorbed += absorbed
         if absorbed == 0:
             break
@@ -2501,7 +2510,9 @@ def close_free_vertices(
     for i in range(len(result)):
         result[i] = _deduplicate_polyline(result[i], tolerance)
 
-    result, junctions_added = _insert_junction_points(result, tolerance, snap_tolerance)
+    result, junctions_added = _insert_junction_points(
+        result, tolerance, snap_tolerance, neighbours=absorb_neighbours,
+    )
     if junctions_added > 0:
         messages.append(f"Inserted {junctions_added} junction points from neighbour intersections")
         for i in range(len(result)):
@@ -2514,6 +2525,7 @@ def _insert_junction_points(
     polylines: list[np.ndarray],
     tolerance: float,
     snap_tolerance: float,
+    neighbours: dict[int, list[int]] | None = None,
 ) -> tuple[list[np.ndarray], int]:
     """Insert junction points that neighbours share but a cell lacks.
 
@@ -2525,7 +2537,8 @@ def _insert_junction_points(
     Returns ``(updated_polylines, total_inserted)``.
     """
     result = [p.copy() for p in polylines]
-    neighbours = find_polyline_neighbours(result, snap_tolerance)
+    if neighbours is None:
+        neighbours = find_polyline_neighbours(result, snap_tolerance)
     junction_limit = max(snap_tolerance * 30, 0.6)
     total_inserted = 0
 
@@ -2556,11 +2569,7 @@ def _insert_junction_points(
                 continue
 
             pt = entries[0][2]
-            near_existing = any(
-                float(np.linalg.norm(pt - u_c[k])) < snap_tolerance
-                for k in range(len(u_c))
-            )
-            if near_existing:
+            if len(u_c) > 0 and float(np.min(np.linalg.norm(u_c - pt, axis=1))) < snap_tolerance:
                 continue
 
             d_seg = _distance_point_to_polyline(pt, closed_c)
@@ -2611,6 +2620,7 @@ def _absorb_nearby_neighbour_vertices(
     polylines: list[np.ndarray],
     tolerance: float,
     snap_tolerance: float,
+    neighbours: dict[int, list[int]] | None = None,
 ) -> tuple[list[np.ndarray], int]:
     """Insert neighbour vertices that lie on our polyline but aren't shared.
 
@@ -2622,7 +2632,8 @@ def _absorb_nearby_neighbour_vertices(
     Returns ``(updated_polylines, total_absorbed)``.
     """
     result = [p.copy() for p in polylines]
-    neighbours = find_polyline_neighbours(result, snap_tolerance)
+    if neighbours is None:
+        neighbours = find_polyline_neighbours(result, snap_tolerance)
     absorb_limit = snap_tolerance * 10
     total_absorbed = 0
 
@@ -2641,14 +2652,15 @@ def _absorb_nearby_neighbour_vertices(
 
             shared_c = {ia for ia, _ in _find_shared_vertex_pairs(u_c, u_n, snap_tolerance)}
 
+            if len(u_n) == 0 or len(u_c) == 0:
+                continue
+            n_to_c_dists = cdist(u_n, u_c)
+            n_min_dists = n_to_c_dists.min(axis=1)
+
             for vi in range(len(u_n)):
-                pt = u_n[vi]
-                near_existing = any(
-                    float(np.linalg.norm(pt - u_c[k])) < snap_tolerance
-                    for k in range(len(u_c))
-                )
-                if near_existing:
+                if n_min_dists[vi] < snap_tolerance:
                     continue
+                pt = u_n[vi]
 
                 best_seg = -1
                 best_d = float("inf")
