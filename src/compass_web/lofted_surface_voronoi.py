@@ -503,7 +503,7 @@ def extract_surface_mesh(mesh: pv.PolyData) -> pv.PolyData:
         return pv.PolyData()
     surface = mesh.extract_surface(algorithm="dataset_surface").clean()
     if surface.n_cells > 0:
-        surface = _strip_stale_cell_arrays(surface).triangulate()
+        surface = _strip_stale_cell_arrays(_strip_stale_cell_arrays(surface).triangulate())
     return surface
 
 

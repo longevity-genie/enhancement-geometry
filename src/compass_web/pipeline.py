@@ -197,7 +197,9 @@ def build_export_trimesh(solids_list: list[pv.PolyData]) -> trimesh.Trimesh:
         )
         trimesh.repair.fix_normals(tm)
         trimesh.repair.fix_winding(tm)
-        if tm.is_volume:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            is_vol = tm.is_volume
+        if is_vol:
             cell_tms.append(tm)
         else:
             dropped += 1
